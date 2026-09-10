@@ -1,0 +1,127 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Everything except extension-module. That feature tells pyo3 not to link libpython,
+  # which is right for the wheel and fatal for a test binary, so --all-features must not
+  # be used anywhere a binary is linked.
+  LIB_FEATURES: azure,fast-gzip
+
+jobs:
+  check:
+    name: Format, lint and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins the version and pulls in rustfmt and clippy, so the
+      # verdict here matches a developer's machine.
+      - name: Show toolchain
+        run: rustc --version && cargo --version && cargo fmt --version && cargo clippy --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --features "$LIB_FEATURES" -- -D warnings
+
+      - name: Tests
+        run: cargo test --features "$LIB_FEATURES"
+
+      - name: Documentation builds without broken links
+        run: cargo doc --no-deps --features "$LIB_FEATURES"
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  wheel:
+    name: manylinux abi3 wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      # azure gives the abfss:// object-store backend; fast-gzip selects the zlib-ng
+      # decoder, which needs cmake and a C toolchain in the manylinux image. abi3 comes
+      # from the pyo3 feature pinned in Cargo.toml, so one wheel covers 3.10 and later.
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x86_64
+          manylinux: "2_28"
+          args: --release --out dist --features extension-module,azure,fast-gzip
+          before-script-linux: |
+            if command -v dnf >/dev/null; then dnf install -y cmake perl; fi
+
+      - name: Verify the wheel is abi3 and imports
+        run: |
+          set -eux
+          ls -l dist/
+          # An abi3 wheel must be tagged cp310-abi3, not cp310-cp310. Without this the
+          # single-artefact promise silently becomes false.
+          ls dist/ | grep -q 'cp310-abi3' || { echo "wheel is not abi3"; exit 1; }
+          python -m pip install --upgrade pip
+          python -m pip install dist/*.whl
+          python -c "
+          import pgdelta
+          print('version', pgdelta.__version__)
+          print('exports', sorted(pgdelta.__all__))
+          assert callable(pgdelta.stream_dump_to_delta)
+          assert issubclass(pgdelta.PartialCommitError, RuntimeError)
+          "
+
+      - name: Round-trip a dump through the wheel
+        run: |
+          python -m pip install deltalake pyarrow tzdata
+          python tools/smoke.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-manylinux-x86_64
+          path: dist/*.whl
+          if-no-files-found: error
+
+  interpreters:
+    name: ${{ matrix.label }}
+    runs-on: ubuntu-latest
+    needs: wheel
+    strategy:
+      fail-fast: false
+      matrix:
+        # One abi3 wheel must load on every interpreter the project claims to support.
+        # DBR 16.4 LTS and 17.3 LTS both ship Python 3.12.3, so one 3.12 job covers both;
+        # 3.10 is the abi3 floor and 3.13 checks the forward half of the promise.
+        include:
+          - python: "3.10"
+            label: "Python 3.10 (abi3 floor)"
+          - python: "3.12"
+            label: "Python 3.12 (DBR 16.4 LTS and 17.3 LTS)"
+          - python: "3.13"
+            label: "Python 3.13 (abi3 forward compatibility)"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel-manylinux-x86_64
+          path: dist
+      - name: Install and round-trip
+        run: |
+          set -eux
+          python -m pip install --upgrade pip
+          python -m pip install dist/*.whl deltalake pyarrow tzdata
+          python -c "import pgdelta, sys; print(sys.version); print(pgdelta.__version__)"
+          python tools/smoke.py

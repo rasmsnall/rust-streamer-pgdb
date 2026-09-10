@@ -1,0 +1,8 @@
+# Revisions that changed formatting only. Skip them when attributing lines:
+#
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# GitHub honours this file automatically.
+
+# Apply cargo fmt across the crate
+9e28c3415090542fb169ad0ded6baa5716f48076

@@ -55,12 +55,35 @@ it on any unattended feed.
 
 ```
 pip install maturin
-maturin build --release
+maturin build --release --features extension-module,azure,fast-gzip
 pip install target/wheels/pgdelta-0.1.0-cp310-abi3-*.whl
 ```
 
-The wheel is `abi3`, so one artefact loads on CPython 3.10 and later. Optional Cargo
-features: `fast-gzip` for the zlib-ng backend, `azure` for `abfss://` output.
+The wheel is `abi3`, so one artefact loads on CPython 3.10 and later, which covers
+Databricks Runtime 16.4 LTS and 17.3 LTS (both ship Python 3.12.3).
+
+Optional Cargo features: `azure` for `abfss://` output, `fast-gzip` for the zlib-ng
+decoder (needs cmake and a C toolchain), `extension-module` for the wheel build. Leave
+`extension-module` off for `cargo test`, which needs to link libpython.
+
+CI builds the manylinux artefact on every push and checks it imports and round-trips on
+3.10, 3.12 and 3.13. To reproduce a release build locally without a Linux box:
+
+```
+docker run --rm -v "$PWD:/io" -w /io ghcr.io/pyo3/maturin build --release --out dist --features extension-module,azure,fast-gzip
+```
+
+## Development
+
+```
+cargo fmt --all --check
+cargo clippy --all-targets --features azure,fast-gzip -- -D warnings
+cargo test --features azure,fast-gzip
+python tools/smoke.py          # end-to-end, against an installed wheel
+```
+
+These are exactly the gates CI runs. The toolchain is pinned in `rust-toolchain.toml` so
+rustfmt and clippy agree between a laptop and the runner.
 
 ## Documentation
 
