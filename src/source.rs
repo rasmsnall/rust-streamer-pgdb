@@ -133,11 +133,23 @@ pub fn open(
     Ok((Box::new(reader), Some(size)))
 }
 
-/// Strips a `file://` prefix so that both spellings of a local location work.
+/// Resolves a local location written either as a bare path or as a `file://` URL.
+///
+/// Delegated to `Url::to_file_path`, which knows that `file:///tmp/x` is absolute on Unix
+/// while `file:///C:/x` carries a drive letter on Windows. Stripping the scheme by hand
+/// and trimming leading slashes gets Windows right and turns every absolute Unix path into
+/// a relative one, which then fails to open from whatever the working directory happens to
+/// be.
+///
+/// `to_file_path` refuses a URL valid only for the other platform, so the fallback uses
+/// the URL's own path component rather than handing the whole URI to the filesystem.
 fn local_path(uri: &str) -> std::path::PathBuf {
-    if let Some(rest) = uri.strip_prefix("file://") {
-        // `file:///d:/x` and `file://d:/x` both appear in practice.
-        return std::path::PathBuf::from(rest.trim_start_matches('/'));
+    if uri.starts_with("file://")
+        && let Ok(url) = Url::parse(uri)
+    {
+        return url
+            .to_file_path()
+            .unwrap_or_else(|()| std::path::PathBuf::from(url.path()));
     }
     std::path::PathBuf::from(uri)
 }
@@ -287,6 +299,16 @@ mod tests {
     fn file_urls_and_bare_paths_resolve_alike() {
         let bare = std::env::temp_dir().join("pgdelta-localpath-probe.sql");
         assert_eq!(local_path(&bare.to_string_lossy()), bare);
+
+        // Asserted independently of the host platform, because the bug this guards was
+        // invisible on Windows and fatal on Unix: trimming the leading slash by hand
+        // turned every absolute Unix path into a relative one, and only a Linux run could
+        // see it. Checking the Unix spelling here means a Windows-only run catches it too.
+        assert_eq!(
+            local_path("file:///tmp/day.sql"),
+            std::path::PathBuf::from("/tmp/day.sql"),
+            "the leading slash of a Unix path must survive"
+        );
 
         let as_url = format!("file://{}", bare.to_string_lossy().replace('\\', "/"));
         let from_url = local_path(&as_url);
