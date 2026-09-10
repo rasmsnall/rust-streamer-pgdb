@@ -25,6 +25,7 @@
 #![warn(missing_docs)]
 #![warn(rustdoc::broken_intra_doc_links)]
 
+pub mod builders;
 pub mod chan;
 pub mod copy;
 pub mod dump;
@@ -33,7 +34,6 @@ pub mod pipeline;
 pub mod scan;
 pub mod sink;
 pub mod types;
-pub mod builders;
 pub mod values;
 
 pub use error::{Error, Result};
@@ -48,4 +48,3 @@ use pyo3::prelude::*;
 fn _pgdelta(module: &Bound<'_, PyModule>) -> PyResult<()> {
     python::register(module)
 }
-

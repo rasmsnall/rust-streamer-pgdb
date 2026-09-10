@@ -354,7 +354,9 @@ where
     }
     drop(event_tx);
 
-    let outcome = drive(input, config, progress, &handle, &job_tx, &event_rx, threads);
+    let outcome = drive(
+        input, config, progress, &handle, &job_tx, &event_rx, threads,
+    );
 
     // Shut the pool down and reap it, whatever the outcome. Dropping every job sender
     // ends each worker's `recv`; the event channel has room for a final event from each.
@@ -471,8 +473,7 @@ where
         .limits
         .max_row_bytes
         .max(crate::dump::DEFAULT_CHUNK_BYTES);
-    let mut chunks =
-        ChunkReader::with_limits(reader, crate::dump::DEFAULT_CHUNK_BYTES, max_chunk);
+    let mut chunks = ChunkReader::with_limits(reader, crate::dump::DEFAULT_CHUNK_BYTES, max_chunk);
     let mut scanner = Scanner::new();
 
     let mut table_defs: HashMap<String, TableDef> = HashMap::new();
@@ -530,11 +531,12 @@ where
                         skipping = true;
                         continue;
                     }
-                    let def = table_defs.get(&qualified).ok_or_else(|| {
-                        Error::MalformedCreateTable {
-                            table: qualified.clone(),
-                        }
-                    })?;
+                    let def =
+                        table_defs
+                            .get(&qualified)
+                            .ok_or_else(|| Error::MalformedCreateTable {
+                                table: qualified.clone(),
+                            })?;
                     let resolved = resolve_copy_columns(def, &columns)?;
                     let pairs: Vec<(String, ResolvedType)> =
                         columns.iter().cloned().zip(resolved).collect();
@@ -828,8 +830,7 @@ mod tests {
     use std::io::Cursor;
 
     fn tmpdir(tag: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("pgdelta-pipe-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pgdelta-pipe-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -885,12 +886,20 @@ COPY public.events (id, kind) FROM stdin;
         assert_eq!(report.total_rows, 5);
         assert_eq!(report.tables.len(), 2);
 
-        let users = report.tables.iter().find(|t| t.table == "public.users").unwrap();
+        let users = report
+            .tables
+            .iter()
+            .find(|t| t.table == "public.users")
+            .unwrap();
         assert_eq!(users.rows, 3);
         assert!(users.delta_version >= 1, "table must be committed");
         assert!(users.text_fallback_columns.is_empty());
 
-        let events = report.tables.iter().find(|t| t.table == "public.events").unwrap();
+        let events = report
+            .tables
+            .iter()
+            .find(|t| t.table == "public.events")
+            .unwrap();
         assert_eq!(events.rows, 2);
         assert_eq!(
             events.text_fallback_columns,
@@ -906,7 +915,8 @@ COPY public.events (id, kind) FROM stdin;
         let dir = tmpdir("fanout");
         // Rows enough to force several 16 MiB chunks, so more than one worker sees the
         // block and the per-worker staged actions must be pooled.
-        let mut body = String::from("CREATE TABLE public.wide (\n    id integer,\n    blob text\n);\n");
+        let mut body =
+            String::from("CREATE TABLE public.wide (\n    id integer,\n    blob text\n);\n");
         body.push_str("COPY public.wide (id, blob) FROM stdin;\n");
         let filler = "x".repeat(200);
         for i in 0..300_000 {
@@ -925,7 +935,11 @@ COPY public.events (id, kind) FROM stdin;
         assert_eq!(report.total_rows, 300_000);
         let wide = &report.tables[0];
         assert_eq!(wide.rows, 300_000);
-        assert!(wide.batches >= 4, "expected many batches, got {}", wide.batches);
+        assert!(
+            wide.batches >= 4,
+            "expected many batches, got {}",
+            wide.batches
+        );
         assert!(wide.delta_version >= 1);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -938,8 +952,7 @@ COPY public.events (id, kind) FROM stdin;
         let dir = tmpdir("gzbytes");
         let plain = dump(TWO_TABLES);
 
-        let mut encoder =
-            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         std::io::Write::write_all(&mut encoder, &plain).unwrap();
         let gz = encoder.finish().unwrap();
         assert!(gz.len() < plain.len(), "fixture must actually compress");

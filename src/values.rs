@@ -168,7 +168,8 @@ pub fn parse_decimal(v: &[u8], scale: i8, column: &str) -> Result<Option<i128>> 
     if int_part.is_empty() && frac_part.is_empty() {
         return Err(bad(column, "numeric"));
     }
-    if !int_part.bytes().all(|b| b.is_ascii_digit()) || !frac_part.bytes().all(|b| b.is_ascii_digit())
+    if !int_part.bytes().all(|b| b.is_ascii_digit())
+        || !frac_part.bytes().all(|b| b.is_ascii_digit())
     {
         return Err(bad(column, "numeric"));
     }
@@ -192,7 +193,9 @@ pub fn parse_decimal(v: &[u8], scale: i8, column: &str) -> Result<Option<i128>> 
     }
     // Pad when the value carried fewer fractional digits than the column declares.
     for _ in frac_keep.len()..scale {
-        unscaled = unscaled.checked_mul(10).ok_or_else(|| bad(column, "numeric"))?;
+        unscaled = unscaled
+            .checked_mul(10)
+            .ok_or_else(|| bad(column, "numeric"))?;
     }
     Ok(Some(if negative { -unscaled } else { unscaled }))
 }
@@ -462,7 +465,10 @@ mod tests {
     fn integers_round_trip_and_reject_overflow() {
         assert_eq!(parse_i16(b"-32768", C).unwrap(), Some(-32768));
         assert_eq!(parse_i32(b"2147483647", C).unwrap(), Some(2147483647));
-        assert_eq!(parse_i64(b"-9223372036854775808", C).unwrap(), Some(i64::MIN));
+        assert_eq!(
+            parse_i64(b"-9223372036854775808", C).unwrap(),
+            Some(i64::MIN)
+        );
         assert!(parse_i16(b"32768", C).is_err());
         assert!(parse_i32(b"abc", C).is_err());
     }
@@ -541,7 +547,10 @@ mod tests {
 
     #[test]
     fn timestamps_combine_date_and_time() {
-        assert_eq!(parse_timestamp(b"1970-01-01 00:00:00", false, C).unwrap(), Some(0));
+        assert_eq!(
+            parse_timestamp(b"1970-01-01 00:00:00", false, C).unwrap(),
+            Some(0)
+        );
         assert_eq!(
             parse_timestamp(b"1970-01-01 00:00:01", false, C).unwrap(),
             Some(1_000_000)
@@ -580,7 +589,10 @@ mod tests {
     #[test]
     fn naive_timestamp_ignores_a_trailing_sign() {
         // With tz false there is no offset to strip, and a bare date must still parse.
-        assert_eq!(parse_timestamp(b"2024-01-01", false, C).unwrap(), parse_timestamp(b"2024-01-01 00:00:00", false, C).unwrap());
+        assert_eq!(
+            parse_timestamp(b"2024-01-01", false, C).unwrap(),
+            parse_timestamp(b"2024-01-01 00:00:00", false, C).unwrap()
+        );
     }
 
     #[test]
@@ -593,7 +605,10 @@ mod tests {
     fn times_parse_with_and_without_fractions() {
         assert_eq!(parse_time(b"00:00:00", C).unwrap(), Some(0));
         assert_eq!(parse_time(b"01:00:00", C).unwrap(), Some(3_600_000_000));
-        assert_eq!(parse_time(b"23:59:59.999999", C).unwrap(), Some(MICROS_PER_DAY - 1));
+        assert_eq!(
+            parse_time(b"23:59:59.999999", C).unwrap(),
+            Some(MICROS_PER_DAY - 1)
+        );
         assert!(parse_time(b"25:00:00", C).is_err());
     }
 
@@ -629,7 +644,10 @@ mod tests {
     fn errors_never_carry_the_value() {
         let err = parse_i32(b"secret-customer-data", C).unwrap_err();
         let rendered = err.to_string();
-        assert!(!rendered.contains("secret"), "error leaked row data: {rendered}");
+        assert!(
+            !rendered.contains("secret"),
+            "error leaked row data: {rendered}"
+        );
         assert!(rendered.contains("col"));
     }
 }

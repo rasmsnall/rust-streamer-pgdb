@@ -489,13 +489,7 @@ mod tests {
             ..Default::default()
         };
         let err = fields(b"abc", limits).next().unwrap().unwrap_err();
-        assert_eq!(
-            err,
-            Error::FieldTooLarge {
-                len: 3,
-                limit: 2
-            }
-        );
+        assert_eq!(err, Error::FieldTooLarge { len: 3, limit: 2 });
 
         let limits = Limits {
             max_columns: 2,

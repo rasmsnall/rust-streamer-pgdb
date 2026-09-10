@@ -233,7 +233,9 @@ impl Scanner {
         loop {
             match self.state {
                 State::Sql => {
-                    let Some(nl) = memchr::memchr(b'\n', input) else { break };
+                    let Some(nl) = memchr::memchr(b'\n', input) else {
+                        break;
+                    };
                     let line = strip_cr(&input[..nl]);
                     self.sql_line(line, &mut events)?;
                     input = &input[nl + 1..];
@@ -689,10 +691,8 @@ pub fn parse_create_table(ddl: &[u8]) -> Result<TableDef> {
 /// [`Error::MalformedCopyHeader`] if the table name cannot be read. The reported offset
 /// is zero, because this function sees one statement rather than the whole dump.
 pub fn parse_copy_header(line: &[u8]) -> Result<(TableName, Vec<String>)> {
-    let after_kw =
-        strip_prefix_ci(line.trim_ascii_start(), b"COPY ").ok_or(Error::MalformedCopyHeader {
-            offset: 0,
-        })?;
+    let after_kw = strip_prefix_ci(line.trim_ascii_start(), b"COPY ")
+        .ok_or(Error::MalformedCopyHeader { offset: 0 })?;
     let (table, rest) = take_qualified(after_kw).ok_or(Error::MalformedCopyHeader { offset: 0 })?;
 
     let mut columns = Vec::new();
@@ -714,7 +714,8 @@ pub fn parse_copy_header(line: &[u8]) -> Result<(TableName, Vec<String>)> {
 mod tests {
     use super::*;
 
-    const PREAMBLE: &[u8] = b"-- Dumped from database version 17.2\n-- Dumped by pg_dump version 17.2\n";
+    const PREAMBLE: &[u8] =
+        b"-- Dumped from database version 17.2\n-- Dumped by pg_dump version 17.2\n";
 
     fn events_of<'a>(s: &mut Scanner, chunk: &'a [u8]) -> Vec<Event<'a>> {
         s.feed(chunk).unwrap()
@@ -745,9 +746,7 @@ mod tests {
     #[test]
     fn unqualified_major_is_fatal() {
         let mut s = Scanner::new();
-        let err = s
-            .feed(b"-- Dumped by pg_dump version 18.0\n")
-            .unwrap_err();
+        let err = s.feed(b"-- Dumped by pg_dump version 18.0\n").unwrap_err();
         assert_eq!(err, Error::UnsupportedDumpVersion { found: 18 });
     }
 
@@ -865,7 +864,8 @@ INHERITS (public.parent);",
         let ev = s.feed(&dump).unwrap();
         s.finish().unwrap();
         assert!(
-            ev.iter().any(|e| matches!(e, Event::Table(d) if d.name.table == "staging")),
+            ev.iter()
+                .any(|e| matches!(e, Event::Table(d) if d.name.table == "staging")),
             "no table definition was emitted for an unlogged table"
         );
     }
@@ -935,7 +935,10 @@ INHERITS (public.parent);",
 
         assert!(s.feed(b"left").unwrap().is_empty());
         let ev = s.feed(b"over\tright\n\\.\n").unwrap();
-        assert_eq!(ev[0], Event::CopyRows(Cow::Owned(b"leftover\tright\n".to_vec())));
+        assert_eq!(
+            ev[0],
+            Event::CopyRows(Cow::Owned(b"leftover\tright\n".to_vec()))
+        );
         assert!(matches!(ev[1], Event::CopyEnd { .. }));
     }
 

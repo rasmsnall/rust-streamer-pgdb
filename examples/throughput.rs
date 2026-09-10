@@ -36,8 +36,18 @@ fn rng(state: &mut u64) -> u64 {
 /// escape, so the escape path is exercised rather than optimised away.
 fn synthetic_rows(target: usize) -> Vec<u8> {
     const WORDS: &[&str] = &[
-        "invoice", "shipment", "pending", "cancelled", "warehouse", "customer",
-        "adjustment", "reconciled", "partial", "backorder", "credit", "return",
+        "invoice",
+        "shipment",
+        "pending",
+        "cancelled",
+        "warehouse",
+        "customer",
+        "adjustment",
+        "reconciled",
+        "partial",
+        "backorder",
+        "credit",
+        "return",
     ];
     let mut out = Vec::with_capacity(target + 1024);
     let mut s: u64 = 0x2545F4914F6CDD1D;
@@ -107,7 +117,8 @@ fn main() {
     let decode = t.elapsed().as_secs_f64();
 
     // Scan: the sequential stage, measured over the same bytes wrapped in a block.
-    let mut dump = b"-- Dumped by pg_dump version 17.2\nCOPY public.t (a, b, c, d) FROM stdin;\n".to_vec();
+    let mut dump =
+        b"-- Dumped by pg_dump version 17.2\nCOPY public.t (a, b, c, d) FROM stdin;\n".to_vec();
     dump.extend_from_slice(&data);
     dump.extend_from_slice(b"\\.\n");
 
@@ -140,7 +151,10 @@ fn main() {
     assert_eq!(inflated, data.len());
 
     println!("input            {mib:.0} MiB, {count} rows");
-    println!("gzip size        {:.0} MiB  ({ratio:.1}x)", gz.len() as f64 / (1024.0 * 1024.0));
+    println!(
+        "gzip size        {:.0} MiB  ({ratio:.1}x)",
+        gz.len() as f64 / (1024.0 * 1024.0)
+    );
     println!("gunzip+chunk     {gunzip:.3} s   {:.0} MiB/s", mib / gunzip);
     println!("decode           {decode:.3} s   {:.0} MiB/s", mib / decode);
     println!("scan             {scan:.3} s   {:.0} MiB/s", mib / scan);
@@ -148,8 +162,14 @@ fn main() {
     println!();
     let gz_rate = mib / gunzip;
     let dec_rate = mib / decode;
-    println!("48 GB:  gunzip {:.1} min (serial floor), decode {:.1} min on one core",
-        49152.0 / gz_rate / 60.0, 49152.0 / dec_rate / 60.0);
-    println!("480 GB: gunzip {:.1} min (serial floor), decode {:.1} min on one core",
-        491520.0 / gz_rate / 60.0, 491520.0 / dec_rate / 60.0);
+    println!(
+        "48 GB:  gunzip {:.1} min (serial floor), decode {:.1} min on one core",
+        49152.0 / gz_rate / 60.0,
+        49152.0 / dec_rate / 60.0
+    );
+    println!(
+        "480 GB: gunzip {:.1} min (serial floor), decode {:.1} min on one core",
+        491520.0 / gz_rate / 60.0,
+        491520.0 / dec_rate / 60.0
+    );
 }

@@ -259,7 +259,10 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
-        let mut all: Vec<_> = consumers.into_iter().flat_map(|c| c.join().unwrap()).collect();
+        let mut all: Vec<_> = consumers
+            .into_iter()
+            .flat_map(|c| c.join().unwrap())
+            .collect();
         all.sort_unstable();
         assert_eq!(all, (0..producers * per).collect::<Vec<_>>());
     }

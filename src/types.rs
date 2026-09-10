@@ -376,15 +376,24 @@ mod tests {
             resolve("numeric(5,-2)").is_textual(),
             "negative scale is legal in PG15+ and must degrade"
         );
-        assert!(!resolve("numeric(5,5)").is_textual(), "scale == precision fits");
+        assert!(
+            !resolve("numeric(5,5)").is_textual(),
+            "scale == precision fits"
+        );
         assert!(!resolve("numeric(5,0)").is_textual());
     }
 
     #[test]
     fn temporal_types_and_their_zones() {
         assert_eq!(pg("date"), PgType::Date);
-        assert_eq!(pg("timestamp without time zone"), PgType::Timestamp { tz: false });
-        assert_eq!(pg("timestamp with time zone"), PgType::Timestamp { tz: true });
+        assert_eq!(
+            pg("timestamp without time zone"),
+            PgType::Timestamp { tz: false }
+        );
+        assert_eq!(
+            pg("timestamp with time zone"),
+            PgType::Timestamp { tz: true }
+        );
         assert_eq!(pg("timestamptz"), PgType::Timestamp { tz: true });
         assert_eq!(pg("time without time zone"), PgType::Time { tz: false });
         assert_eq!(pg("time with time zone"), PgType::Time { tz: true });
@@ -392,8 +401,14 @@ mod tests {
 
     #[test]
     fn parameters_in_the_middle_of_a_name() {
-        assert_eq!(pg("timestamp(3) without time zone"), PgType::Timestamp { tz: false });
-        assert_eq!(pg("timestamp(6) with time zone"), PgType::Timestamp { tz: true });
+        assert_eq!(
+            pg("timestamp(3) without time zone"),
+            PgType::Timestamp { tz: false }
+        );
+        assert_eq!(
+            pg("timestamp(6) with time zone"),
+            PgType::Timestamp { tz: true }
+        );
         assert_eq!(pg("time(0) without time zone"), PgType::Time { tz: false });
     }
 
@@ -426,7 +441,13 @@ mod tests {
 
     #[test]
     fn arrays_become_text_whatever_the_element() {
-        for t in ["integer[]", "text[]", "numeric(10,2)[]", "integer[3]", "integer[][]"] {
+        for t in [
+            "integer[]",
+            "text[]",
+            "numeric(10,2)[]",
+            "integer[3]",
+            "integer[][]",
+        ] {
             let r = resolve(t);
             assert!(r.is_array, "{t}");
             assert!(r.is_textual(), "{t} must be written as text");
@@ -446,7 +467,10 @@ mod tests {
     fn case_and_whitespace_are_tolerated() {
         assert_eq!(pg("INTEGER"), PgType::Integer);
         assert_eq!(pg("  Double   Precision "), PgType::DoublePrecision);
-        assert_eq!(pg("TIMESTAMP  WITHOUT  TIME  ZONE"), PgType::Timestamp { tz: false });
+        assert_eq!(
+            pg("TIMESTAMP  WITHOUT  TIME  ZONE"),
+            PgType::Timestamp { tz: false }
+        );
     }
 
     #[test]

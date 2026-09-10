@@ -233,7 +233,10 @@ impl fmt::Display for Error {
                 write!(f, "malformed CREATE TABLE for {table}")
             }
             Error::UnsupportedDumpVersion { found } => {
-                write!(f, "dump produced by unqualified pg_dump major version {found}")
+                write!(
+                    f,
+                    "dump produced by unqualified pg_dump major version {found}"
+                )
             }
             Error::MissingDumpVersion => {
                 f.write_str("dump preamble carries no pg_dump version comment")
@@ -248,12 +251,18 @@ impl fmt::Display for Error {
                 write!(f, "column {column} carries bytes that are not valid UTF-8")
             }
             Error::UnsupportedCompression { format } => {
-                write!(f, "dump uses {format} compression, which this build cannot decode")
+                write!(
+                    f,
+                    "dump uses {format} compression, which this build cannot decode"
+                )
             }
             Error::Arrow { message } => write!(f, "arrow error: {message}"),
             Error::Delta { message } => write!(f, "delta error: {message}"),
             Error::TableExists { table } => {
-                write!(f, "table {table} already holds data and mode is error-if-exists")
+                write!(
+                    f,
+                    "table {table} already holds data and mode is error-if-exists"
+                )
             }
             Error::Io { message } => write!(f, "io error: {message}"),
             Error::Interrupted => f.write_str("load interrupted by caller"),

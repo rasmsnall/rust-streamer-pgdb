@@ -505,10 +505,7 @@ mod tests {
             qualified("", "users"),
             qualified("public", "us:ers"),
         ] {
-            assert!(
-                relative_path(&name).is_err(),
-                "{name} must be rejected"
-            );
+            assert!(relative_path(&name).is_err(), "{name} must be rejected");
         }
     }
 
@@ -557,8 +554,7 @@ mod tests {
             assert!(sink.staged_actions() > 0, "staging must produce actions");
 
             // Phase one is done and Parquet exists, but a fresh reader sees nothing.
-            let reader_url =
-                ensure_table_uri(format!("{}/public/users", prefix(&dir))).unwrap();
+            let reader_url = ensure_table_uri(format!("{}/public/users", prefix(&dir))).unwrap();
             let mut reader = DeltaTableBuilder::from_url(reader_url)
                 .unwrap()
                 .build()
@@ -595,8 +591,16 @@ mod tests {
             sink.commit().await.unwrap();
 
             let protocol = sink.table.snapshot().unwrap().protocol();
-            assert_eq!(protocol.min_reader_version(), 1, "reader floor must stay at 1");
-            assert_eq!(protocol.min_writer_version(), 2, "writer floor must stay at 2");
+            assert_eq!(
+                protocol.min_reader_version(),
+                1,
+                "reader floor must stay at 1"
+            );
+            assert_eq!(
+                protocol.min_writer_version(),
+                2,
+                "writer floor must stay at 2"
+            );
         });
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -610,17 +614,28 @@ mod tests {
 
         rt().block_on(async {
             let p = prefix(&dir);
-            let mut first = TableSink::open(&p, &bare("t"), &schema(), WriteMode::Append, &HashMap::new())
-                .await
-                .unwrap();
+            let mut first = TableSink::open(
+                &p,
+                &bare("t"),
+                &schema(),
+                WriteMode::Append,
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
             first.write(batch(&[1, 2], &["a", "b"])).await.unwrap();
             first.stage().await.unwrap();
             first.commit().await.unwrap();
 
-            let mut second =
-                TableSink::open(&p, &bare("t"), &schema(), WriteMode::Overwrite, &HashMap::new())
-                    .await
-                    .unwrap();
+            let mut second = TableSink::open(
+                &p,
+                &bare("t"),
+                &schema(),
+                WriteMode::Overwrite,
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
             second.write(batch(&[9], &["z"])).await.unwrap();
             second.stage().await.unwrap();
             second.commit().await.unwrap();

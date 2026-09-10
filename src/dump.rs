@@ -268,7 +268,10 @@ mod tests {
 
     #[test]
     fn gzip_round_trips() {
-        let data: Vec<u8> = (0..5000).map(|i| format!("row {i}\n")).collect::<String>().into();
+        let data: Vec<u8> = (0..5000)
+            .map(|i| format!("row {i}\n"))
+            .collect::<String>()
+            .into();
         let (c, mut r) = decompressed(Cursor::new(gzip(&data))).unwrap();
         assert_eq!(c, Compression::Gzip);
         let mut got = Vec::new();
@@ -302,9 +305,20 @@ mod tests {
 
     #[test]
     fn every_chunk_ends_on_a_newline() {
-        let data: Vec<u8> = (0..2000).map(|i| format!("row {i}\n")).collect::<String>().into();
-        let chunks = collect(ChunkReader::with_limits(Cursor::new(data.clone()), 64, 1 << 20));
-        assert!(chunks.len() > 10, "expected many chunks, got {}", chunks.len());
+        let data: Vec<u8> = (0..2000)
+            .map(|i| format!("row {i}\n"))
+            .collect::<String>()
+            .into();
+        let chunks = collect(ChunkReader::with_limits(
+            Cursor::new(data.clone()),
+            64,
+            1 << 20,
+        ));
+        assert!(
+            chunks.len() > 10,
+            "expected many chunks, got {}",
+            chunks.len()
+        );
         for c in &chunks {
             assert_eq!(c.last(), Some(&b'\n'));
         }

@@ -279,7 +279,10 @@ impl BatchBuilder {
         Self {
             schema: Arc::new(arrow_schema(columns)),
             names: columns.iter().map(|(n, _)| n.clone()).collect(),
-            columns: columns.iter().map(|(_, rt)| ColumnBuilder::new(rt)).collect(),
+            columns: columns
+                .iter()
+                .map(|(_, rt)| ColumnBuilder::new(rt))
+                .collect(),
             rows: 0,
             bytes: 0,
             max_rows,
@@ -426,7 +429,10 @@ mod tests {
         assert_eq!(arrow_type(&resolve("boolean")), DataType::Boolean);
         assert_eq!(arrow_type(&resolve("date")), DataType::Date32);
         assert_eq!(arrow_type(&resolve("bytea")), DataType::Binary);
-        assert_eq!(arrow_type(&resolve("numeric(10,2)")), DataType::Decimal128(10, 2));
+        assert_eq!(
+            arrow_type(&resolve("numeric(10,2)")),
+            DataType::Decimal128(10, 2)
+        );
         assert_eq!(
             arrow_type(&resolve("timestamp without time zone")),
             DataType::Timestamp(TimeUnit::Microsecond, None)
@@ -443,7 +449,14 @@ mod tests {
 
     #[test]
     fn everything_uncertain_becomes_utf8() {
-        for t in ["numeric", "numeric(39,2)", "integer[]", "public.my_enum", "interval", "jsonb"] {
+        for t in [
+            "numeric",
+            "numeric(39,2)",
+            "integer[]",
+            "public.my_enum",
+            "interval",
+            "jsonb",
+        ] {
             assert_eq!(arrow_type(&resolve(t)), DataType::Utf8, "{t}");
         }
     }
@@ -469,22 +482,35 @@ mod tests {
             Some(br"\x4869"),
         ])
         .unwrap();
-        b.append_row(&[Some(b"2"), None, None, None, None, None]).unwrap();
+        b.append_row(&[Some(b"2"), None, None, None, None, None])
+            .unwrap();
 
         assert_eq!(b.rows(), 2);
         let batch = b.finish().unwrap().unwrap();
         assert_eq!(batch.num_rows(), 2);
         assert_eq!(batch.num_columns(), 6);
 
-        let ids = batch.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
         assert_eq!(ids.value(0), 1);
         assert_eq!(ids.value(1), 2);
 
-        let names = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        let names = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         assert_eq!(names.value(0), "alice");
         assert!(names.is_null(1));
 
-        let price = batch.column(2).as_any().downcast_ref::<Decimal128Array>().unwrap();
+        let price = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap();
         assert_eq!(price.value(0), 12345);
 
         let made = batch
@@ -494,10 +520,18 @@ mod tests {
             .unwrap();
         assert_eq!(made.value(0), 1_000_000);
 
-        let born = batch.column(4).as_any().downcast_ref::<Date32Array>().unwrap();
+        let born = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .unwrap();
         assert_eq!(born.value(0), 1);
 
-        let blob = batch.column(5).as_any().downcast_ref::<BinaryArray>().unwrap();
+        let blob = batch
+            .column(5)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
         assert_eq!(blob.value(0), b"Hi");
     }
 
@@ -508,7 +542,10 @@ mod tests {
         b.append_row(&[Some(b"1")]).unwrap();
         assert_eq!(b.finish().unwrap().unwrap().num_rows(), 1);
         assert_eq!(b.rows(), 0);
-        assert!(b.finish().unwrap().is_none(), "empty flush must be harmless");
+        assert!(
+            b.finish().unwrap().is_none(),
+            "empty flush must be harmless"
+        );
         b.append_row(&[Some(b"2")]).unwrap();
         assert_eq!(b.finish().unwrap().unwrap().num_rows(), 1);
     }
@@ -518,7 +555,8 @@ mod tests {
         let columns = cols(&[("t", "timestamp without time zone"), ("n", "numeric(5,2)")]);
         let mut b = BatchBuilder::new(&columns, 1000, 1 << 20);
         b.append_row(&[Some(b"infinity"), Some(b"NaN")]).unwrap();
-        b.append_row(&[Some(b"1970-01-01 00:00:00"), Some(b"1.00")]).unwrap();
+        b.append_row(&[Some(b"1970-01-01 00:00:00"), Some(b"1.00")])
+            .unwrap();
 
         assert_eq!(b.substitutions(), &[1, 1]);
         let batch = b.finish().unwrap().unwrap();
@@ -536,7 +574,10 @@ mod tests {
             batch.schema().field(0).data_type(),
             &DataType::Timestamp(TimeUnit::Microsecond, Some(UTC.into()))
         );
-        assert_eq!(batch.column(0).data_type(), batch.schema().field(0).data_type());
+        assert_eq!(
+            batch.column(0).data_type(),
+            batch.schema().field(0).data_type()
+        );
     }
 
     #[test]
@@ -545,7 +586,10 @@ mod tests {
         let mut b = BatchBuilder::new(&columns, 10, 1 << 20);
         assert_eq!(
             b.append_row(&[Some(b"1")]).unwrap_err(),
-            Error::FieldCountMismatch { found: 1, expected: 2 }
+            Error::FieldCountMismatch {
+                found: 1,
+                expected: 2
+            }
         );
     }
 
@@ -590,7 +634,11 @@ mod tests {
         let mut b = BatchBuilder::new(&columns, 10, 1 << 20);
         b.append_row(&[Some(b"{a,b,c}")]).unwrap();
         let batch = b.finish().unwrap().unwrap();
-        let got = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        let got = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         assert_eq!(got.value(0), "{a,b,c}");
     }
 }

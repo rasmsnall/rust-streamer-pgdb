@@ -9,9 +9,9 @@
 
 use std::collections::HashMap;
 
+use pyo3::create_exception;
 use pyo3::exceptions::{PyIOError, PyKeyboardInterrupt, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::create_exception;
 use pyo3::types::PyDict;
 
 use crate::copy::Limits;
