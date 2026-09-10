@@ -183,7 +183,7 @@ impl ObjectSource {
     /// Issues a GET from the current offset, so the same call both starts and resumes.
     fn open_stream(&mut self) -> Result<()> {
         let options = GetOptions {
-            range: (self.delivered > 0).then(|| GetRange::Offset(self.delivered)),
+            range: (self.delivered > 0).then_some(GetRange::Offset(self.delivered)),
             ..Default::default()
         };
         let result = self
