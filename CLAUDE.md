@@ -1,13 +1,14 @@
 # rust-streamer-pgdb
 
 Python library, implemented in Rust, that streams `pg_dump` output directly into
-Delta Lake tables for use from Databricks. Status: **design agreed, no code written yet.**
+Delta Lake tables for use from Databricks. Status: **implemented end to end.** The
+pipeline decodes in parallel, the wheel builds, and all three documents are written.
 
 ## Goals / constraints (from the user, verbatim intent)
 
 - Rust core, Python bindings. Target consumer is Databricks.
 - **Security considered first**, then whether the approach is actually the best one.
-- Fast. Streaming, bounded memory — never materialise a table.
+- Fast. Streaming, bounded memory. Never materialise a table.
 - Minimal dependency surface; only crates that are widely used and maintained.
 - **Code is not to be over-commented.** Comment the non-obvious only.
 
@@ -29,8 +30,8 @@ pg_dump emits its pre-data section before its data section, so every `CREATE TAB
 is seen before the `COPY` that needs it. Single pass, no seek, no buffering of the dump.
 
 ### Scanner states
-- `Sql` — accumulate `CREATE TABLE` statements; watch for `COPY <tbl> (<cols>) FROM stdin;`
-- `Copy` — decode rows until a line that is exactly `\.`
+- `Sql`: accumulate `CREATE TABLE` statements; watch for `COPY <tbl> (<cols>) FROM stdin;`
+- `Copy`: decode rows until a line that is exactly `\.`
 
 DDL splitting is paren-depth and quote aware; must tolerate `numeric(10,2)`,
 `character varying(255)`, `timestamp(3) without time zone`, table constraints,
@@ -41,7 +42,7 @@ DDL splitting is paren-depth and quote aware; must tolerate `numeric(10,2)`,
 Dumps arrive **as files, daily, from a third party** whose database is PostgreSQL 17.
 We have no network access to that server. That settles several things:
 
-- **No subprocess.** We never spawn `pg_dump`, so we never need a `pg_dump` binary —
+- **No subprocess.** We never spawn `pg_dump`, so we never need a `pg_dump` binary:
   not 17, not 16, not any. The file-input path is the *only* path.
 - **No PostgreSQL of our own.** The PG16 staging server exists only to turn dump text
   into rows; this library replaces it outright. Nothing queries it, and Delta cannot
@@ -52,7 +53,7 @@ We have no network access to that server. That settles several things:
 What stays version-relevant: the dump preamble carries `-- Dumped from database version
 <v>` and `-- Dumped by pg_dump version <v>`. Parse both, record them in the returned
 stats, and **reject a major we have not qualified.** This is the tripwire for the day
-the third party upgrades to 18 without telling us — which will happen eventually, and
+the third party upgrades to 18 without telling us, which will happen eventually, and
 must fail the load loudly rather than silently mis-parse it.
 
 COPY TEXT is stable across majors, so `copy.rs` is version-agnostic regardless.
@@ -78,7 +79,7 @@ table name, column name and field byte we will ever see:
 - **~450 tables** (447-450 observed). The count varies between dumps, which is itself
   evidence that the table set drifts.
 - Largest table ~60M rows, second ~13M. The remaining ~448 are comparatively small, so
-  per-table commit overhead — not decoding — dominates the tail.
+  per-table commit overhead, not decoding, dominates the tail.
 
 Consequences:
 
@@ -110,7 +111,7 @@ So decode parallelises safely, in a **single pass, no seek, no second read**:
 
 - One **reader thread** pulls the stream sequentially and cuts it into ~16 MB chunks,
   backing each cut up to the last newline and carrying the remainder forward. Finding
-  that boundary is a reverse `memchr` — negligible beside decoding.
+  that boundary is a reverse `memchr`, negligible beside decoding.
 - Newline-aligned chunks go over a bounded channel to a **decode pool**. Workers decode
   whole rows independently, because by construction no row spans a chunk.
 - Workers emit RecordBatches to the writer pool as already described.
@@ -121,14 +122,14 @@ bounded channel keeps memory capped regardless of dump size.
 Row order within a table is not preserved across chunks. Delta tables are unordered, so
 this is fine; carry the chunk index if determinism is ever wanted.
 
-The **scanner stays sequential** — `CREATE TABLE` DDL must be read in order, and COPY
+The **scanner stays sequential**: `CREATE TABLE` DDL must be read in order, and COPY
 block starts and ends must be observed. But DDL is a negligible fraction of the bytes;
 only row interiors go to the pool.
 
 ### Known ceiling
 
 This is a **single-node** design, scaling to the cores and network bandwidth of one
-Databricks driver — good for the high hundreds of GB. Beyond that the next step is
+Databricks driver, good for the high hundreds of GB. Beyond that the next step is
 splitting COPY-block byte ranges across Spark executors: a genuinely different
 architecture needing a seekable input and a boundary-index pass. Not built now, but the
 chunking above is deliberately compatible with it, since both rest on the same
@@ -136,7 +137,7 @@ newline-splittability property.
 
 ### Failure cleanup at scale
 
-A failed phase 1 leaves orphaned Parquet proportional to how far it got — at 480 GB that
+A failed phase 1 leaves orphaned Parquet proportional to how far it got. At 480 GB that
 is a lot of dead bytes. Invisible to readers, but `VACUUM` must actually be scheduled or
 the storage bill grows silently.
 
@@ -144,21 +145,21 @@ the storage bill grows silently.
 
 Requirement from the user: **either the whole dump loads, or it fails.** No partial day.
 
-Delta has **no cross-table transaction** — atomicity is per-table, and ~450 tables mean
+Delta has **no cross-table transaction**: atomicity is per-table, and ~450 tables mean
 ~450 independent commits. Satisfied with a two-phase load:
 
 1. **Decode and stage.** Consume the entire dump, writing every Parquet file for every
    table, committing *nothing*. Data files not referenced by a transaction log are
    invisible to Delta readers.
-2. **Commit.** Only once the stream is consumed cleanly — EOF reached with every COPY
-   block closed by `\.` — commit all ~450 tables.
+2. **Commit.** Only once the stream is consumed cleanly (EOF reached with every COPY
+   block closed by `\.`), commit all ~450 tables.
 
 Any failure in phase 1 leaves orphaned files and **zero visible change**. The
 non-atomic window shrinks from the full multi-hour decode to the phase-2 commit burst,
 which is metadata-only and the least failure-prone part of the pipeline.
 
 This is not *strictly* atomic: a reader during phase 2 can see a mix of day N and N-1.
-If a consumer ever needs strict atomicity, the pattern is a manifest table — write each
+If a consumer ever needs strict atomicity, the pattern is a manifest table: write each
 day under a new load id, then flip the whole set with one commit to a pointer table that
 views resolve. Deferred until a consumer asks, because it constrains how every
 downstream query must be written.
@@ -171,7 +172,7 @@ downstream query must be written.
 - **Type uncertainty degrades, never fails.** An unrecognised Postgres type maps to
   `Utf8`, preserving the literal text, and is reported in the returned stats. Across
   ~450 third-party tables the type zoo is wide; one unknown type must not kill the daily
-  load, and nothing is lost — text can be reinterpreted later.
+  load, and nothing is lost, because text can be reinterpreted later.
 
 ## Dependency budget
 
@@ -179,18 +180,25 @@ downstream query must be written.
 |---|---|
 | `pyo3` | Python bindings |
 | `deltalake` (delta-rs) | Delta write path; brings arrow/parquet/object_store/tokio/chrono |
+| `flate2` | gzip decode. Pure-Rust backend by default, so a wheel needs no C toolchain |
+| `tokio` | Named directly by `sink.rs` and `pipeline.rs`. Pinned to what deltalake resolves |
+| `futures` | Stream combinators over the Delta file listing. Same pinning |
 | `memchr` | SIMD scan for `\n` / `\t` in the hot row loop |
 
 Pinned 2026-09 (probed via cargo; crates.io index reachable): `pyo3 0.29.2`,
-`deltalake 0.32.4`, `memchr 2.8.3`. `/Volumes` FUSE paths need no object-store feature;
-`abfss://` needs deltalake's `azure` feature.
+`deltalake 0.32.4`, `memchr 2.8.3`, `flate2 1.1.10`, `tokio 1.53.1`, `futures 0.3.34`.
+Note pyo3 0.29 renamed `Python::with_gil` to `attach` and `allow_threads` to `detach`,
+and it compiles cleanly under `#![forbid(unsafe_code)]`.
+
+`/Volumes` FUSE paths need no object-store feature; `abfss://` needs deltalake's `azure`
+feature. `fast-gzip` selects the zlib-ng backend and needs a C toolchain and cmake.
 
 Use `deltalake::arrow` re-exports rather than a direct `arrow` dependency, to avoid
 version skew against delta-rs's pinned arrow.
 
 Deliberately **not** used:
-- `thiserror` — hand-rolled error enum instead, ~40 lines.
-- `sqlparser` — hand-rolled DDL splitter. pg_dump emits constructs sqlparser rejects,
+- `thiserror`: hand-rolled error enum instead, ~40 lines.
+- `sqlparser`: hand-rolled DDL splitter. pg_dump emits constructs sqlparser rejects,
   and its output is machine-generated and regular enough to scan directly.
 
 ## Security requirements
@@ -200,7 +208,7 @@ These are requirements, not suggestions. They were the starting point of the des
 1. `#![forbid(unsafe_code)]`.
 2. Spawn `pg_dump` with an **argv vector, never a shell**. No string interpolation
    into a command line anywhere.
-3. Password via the child's `PGPASSWORD` env only — **never argv**, which is
+3. Password via the child's `PGPASSWORD` env only, **never argv**, which is
    world-readable via `/proc/<pid>/cmdline`.
 4. **Scrub conninfo/secrets from every error path.** pg_dump echoes connection
    strings on stderr; that must not reach a Python traceback or a log.
@@ -213,7 +221,7 @@ These are requirements, not suggestions. They were the starting point of the des
 8. Never log row data.
 9. Checked integer parsing throughout; no silent wrap.
 10. Reap the child and **check its exit status**. A non-zero `pg_dump` exit must fail
-    the load loudly — a silently truncated table committed as success is data-integrity
+    the load loudly. A silently truncated table committed as success is data-integrity
     corruption, and is the worst failure mode this library has.
 11. Release the GIL (`Python::allow_threads`) around the streaming work, with periodic
     signal checks so Ctrl-C works.
@@ -237,7 +245,7 @@ These are requirements, not suggestions. They were the starting point of the des
 | `bytea` | `Binary` (decode `\x` hex; fall back to escape format) |
 | `text`,`varchar`,`char`,`uuid`,`json`,`jsonb`,`inet`,enums,arrays,`interval` | `Utf8` |
 
-Arrays and `interval` stay as their unescaped Postgres literal — honest, and avoids
+Arrays and `interval` stay as their unescaped Postgres literal. This is honest, and avoids
 guessing at a structure the caller may not want. Revisit only if asked.
 
 Edge cases that must be handled explicitly: `infinity`/`-infinity` for date and
@@ -249,8 +257,8 @@ timestamp, ` BC` suffixed dates, and `NaN` for numeric.
   Catalog *managed* table. Third-party writers can corrupt UC-managed tables.
 - Schedule `VACUUM`; see open items. Daily full overwrites tombstone the prior day's
   files across every table.
-- Keep the table at **reader v1 / writer v2** — no deletion vectors, no column
-  mapping — so any DBR version can read the result.
+- Keep the table at **reader v1 / writer v2** (no deletion vectors, no column
+  mapping), so any DBR version can read the result.
 - Delta `timestamp` is micros UTC. `timestamp_ntz` needs reader v3 / writer v7, which
   breaks the compatibility floor above. Naive Postgres timestamps are therefore
   assumed UTC by default; an opt-in `naive_timestamps="ntz"` may be added later, and
@@ -281,7 +289,7 @@ pg_dump version`, so a caller can tell after the fact which major produced the d
 
 ## Documentation standard
 
-The library is intended for **unrestricted downstream use — anyone, any time**, so
+The library is intended for **unrestricted downstream use, anyone, any time**, so
 documentation is a build requirement, not a closing task. It is written *with* each
 item, never retrofitted.
 
@@ -298,7 +306,7 @@ different things and both hold:
 - **Errors:** which variants it can return and what causes them.
 - **Panics:** or an explicit statement that it does not panic.
 - **Blocking/async:** whether it blocks, is `async`, or must not be called from an
-  async context. This is mandatory — see the concurrency model in `docs/architecture.md`.
+  async context. This is mandatory; see the concurrency model in `docs/architecture.md`.
 - An example where one compiles.
 
 Enforced with `#![warn(missing_docs)]` and `#![warn(rustdoc::broken_intra_doc_links)]`.
@@ -342,58 +350,74 @@ Regenerate on any docs change with `python tools/md2docx.py`. Requires `python-d
 | `docs/api.md` | Python and Rust surface, parameter semantics, returned stats |
 | `docs/operations.md` | Running it on Databricks, sizing, VACUUM, failure recovery |
 
-Every external claim carries a link — Postgres docs, docs.rs for pinned crate versions,
+Every external claim carries a link: Postgres docs, docs.rs for pinned crate versions,
 the Delta protocol. See the References section of `docs/architecture.md`.
 
-## Planned layout
+## Layout
 
 ```
-src/lib.rs        pyo3 module
-src/error.rs      hand-rolled error enum + secret scrubbing
-src/dump.rs       pg_dump spawn, conninfo handling, exit-status checking
-src/scan.rs       streaming dump scanner (DDL + COPY block detection)
+src/lib.rs        crate docs + pyo3 module shell
+src/error.rs      hand-rolled error enum
+src/dump.rs       compression detection + newline-aligned chunking
+src/scan.rs       streaming dump scanner (DDL + COPY detection, TableName)
 src/copy.rs       COPY TEXT row decoder (hot path)
-src/types.rs      pg type -> arrow type mapping
-src/builders.rs   Arrow column builders
-src/sink.rs       Delta writer
-src/pipeline.rs   orchestration
+src/types.rs      pg type text -> internal type model
+src/values.rs     field bytes -> typed values
+src/builders.rs   Arrow column + batch builders
+src/sink.rs       Delta write path (open_table, TableWriter, commit_table)
+src/chan.rs       bounded MPMC channel feeding the decode pool
+src/pipeline.rs   orchestration (reader thread, decode/encode pool, two-phase commit)
+src/python.rs     pyo3 surface
 python/pgdelta/__init__.py
 python/pgdelta/__init__.pyi
+python/pgdelta/py.typed
+pyproject.toml    maturin config (abi3-py310, mixed layout)
+README.md
+LICENSE
 docs/architecture.md
 docs/api.md
 docs/operations.md
 tools/md2docx.py   generates docs/*.docx from docs/*.md
 ```
 
-Build with maturin (not yet installed locally).
+Build with maturin (`pip install maturin && maturin build --release`).
 
 ## Open items
 
-- **Resolved:** crate versions pinned; see Dependency budget.
-- `maturin` is absent from this machine; need it to build.
-- **Resolved:** the 16-vs-17 question was an artifact of the staging-database
-  architecture. No `pg_dump` binary and no PostgreSQL server are needed at all.
-- Compression of the delivered dump is unknown. If it arrives gzipped, that is a new
-  crate in the dependency budget (`flate2`) and a decode stage ahead of the scanner.
-- Schema-drift policy for a third-party daily feed: when their DDL changes, fail the
-  load or evolve the Delta schema? Needs a decision, not a default.
-- Re-run/idempotency story for a failed daily load.
-- **Resolved:** commit cadence is one commit per table, all deferred to phase 2. No
-  periodic commits — a short table that looks complete is the worst failure mode here.
-- **Resolved:** schema drift is all-or-nothing ("either fail or load"), via two-phase.
-- Do we need all ~450 tables in Delta, or a working subset? Skipping an unwanted COPY
-  block is nearly free (scan newlines for `\.`, decode nothing), so `tables=` filtering
-  belongs in the scanner, not after it.
-- `VACUUM` schedule. Daily overwrites at 48 GB across ~450 tables leave tombstoned
-  files for the default retention window; storage grows quietly without it.
-- Confirm the dump truly arrives uncompressed. Assumed plain; if it is gzipped that
-  adds `flate2` to the budget and a *serial* decode stage that would likely become the
-  pipeline's slowest link.
-- Behaviour when a table disappears from the dump: leave the previous Delta table in
-  place, or mark it stale?
+Resolved and shipped:
+
+- Crate versions pinned; see Dependency budget.
+- `maturin` installed; the wheel builds as `pgdelta-0.1.0-cp310-abi3`.
+- The 16-vs-17 question was an artifact of the staging-database architecture. No
+  `pg_dump` binary and no PostgreSQL server are needed at all.
+- Compression: gzip is detected by magic bytes and decoded via `flate2`. zstd is
+  recognised and rejected with a precise error rather than misparsed.
+- Commit cadence is one commit per table, all deferred to phase 2. No periodic commits,
+  because a short table that looks complete is the worst failure mode here.
+- Schema drift is all-or-nothing ("either fail or load"), via two-phase.
+- `tables=` filtering lives in the scanner. An unwanted COPY block is scanned for its
+  terminator and decoded not at all.
+- Re-run story: `overwrite` is idempotent and a failed run commits nothing, so the
+  recovery procedure is to run it again. Documented in `docs/operations.md`, Chapter V.
+- `VACUUM` guidance and a per-table loop are in `docs/operations.md`, Chapter IV.
+
+Still open, and each needs a decision rather than a default:
+
+- Whether a `VACUUM` schedule actually exists in the job. The library cannot run it and
+  the documentation can only say so.
+- Behaviour when a table disappears from the dump. Today the previous Delta table is
+  left untouched and silently goes stale; nothing detects it.
+- Whether a `numeric` outside Arrow's decimal range should be reported in the stats. It
+  currently degrades to text without appearing in `text_fallback_columns`, which is
+  reserved for types that were not recognised at all.
+- Whether the Python surface should accept a file object as well as a path.
 
 ## Environment notes
 
 - `grep` in this repo's Git Bash crashes on `-P` and sometimes aborts outright.
   Use the Grep tool rather than shelling out to grep.
-- Rust 1.94.0, Python 3.10.11.
+- Git Bash heredocs collapse backslashes. For a patch script containing them, write the
+  script to a file and run it rather than piping it in.
+- The repo is not kept `cargo fmt` clean under default settings; match the surrounding
+  hand style rather than reformatting whole files.
+- Rust 1.94.0, Python 3.10.11, maturin 1.15.0.

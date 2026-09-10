@@ -1,10 +1,11 @@
 # pgdelta: Architecture
 
 **Document type** Technical architecture specification
-**Status** Reader, scanner, decoder, type resolver, value parsers and Arrow builders implemented; Delta sink and Python bindings outstanding
+**Status** Complete and implemented. The pipeline runs end to end, decoding in parallel, behind both the Rust and the Python surface.
 **Audience** Anyone integrating, operating, or modifying this library. No prior context assumed.
-**Version** 1.0
-**Date** 2026-09-09
+**Companion documents** `api.md` for the callable surface, `operations.md` for running it.
+**Version** 1.1
+**Date** 2026-09-10
 
 ---
 
@@ -111,7 +112,7 @@ nothing ever re-parses the dump as SQL.
 
 In scope:
 
-- Plain-format (`--format=plain`) dumps, read from a file or file descriptor.
+- Plain-format (`--format=plain`) dumps, read from a file path. gzip is decoded on the way in.
 - `CREATE TABLE` DDL sufficient to recover column names and types.
 - `COPY ... FROM stdin` data blocks in TEXT format.
 - Writing one Delta table per source table.
@@ -125,6 +126,9 @@ Not in scope:
 - Views, functions, triggers, indexes, grants, and sequences. Delta cannot use them.
 - Incremental or change-data-capture loading. Each run is a full load.
 - Binary-format COPY blocks.
+- Reading from an arbitrary Python file object or file descriptor. The Rust surface accepts
+  any `std::io::Read`, but the Python surface takes a path, because the feed is delivered
+  as files.
 
 ---
 
@@ -176,13 +180,20 @@ Each stage is a module. Data flows in one direction and no stage reads back.
 
 | Stage | Module | Responsibility |
 |---|---|---|
-| Read | `dump.rs` | Open the dump, decompress it, and hand out byte chunks |
-| Scan | `scan.rs` | Track DDL and COPY block boundaries |
-| Decode | `copy.rs` | Convert COPY TEXT bytes to typed values |
-| Type map | `types.rs` | Map PostgreSQL type names to Arrow `DataType` |
+| Read | `dump.rs` | Open the dump, decompress it, and hand out newline-aligned byte chunks |
+| Scan | `scan.rs` | Track DDL and COPY block boundaries, and recover table and column names |
+| Decode | `copy.rs` | Split COPY TEXT bytes into rows and fields, resolving escapes |
+| Type map | `types.rs` | Map PostgreSQL type names to the internal type model |
+| Parse | `values.rs` | Convert unescaped field bytes into typed values |
 | Build | `builders.rs` | Append typed values into Arrow arrays |
-| Write | `sink.rs` | Encode Arrow batches to Parquet, then to Delta |
+| Write | `sink.rs` | Encode Arrow batches to Parquet, then commit to Delta |
+| Transport | `chan.rs` | Bounded multi-producer, multi-consumer channel feeding the decode pool |
 | Orchestrate | `pipeline.rs` | Wire the stages together and own the threads |
+| Bind | `python.rs` | Translate the Python surface onto `pipeline.rs` |
+
+`types.rs` and `values.rs` are deliberately free of any Arrow dependency. They resolve the
+*text* of a type and the *text* of a value respectively, which is the intricate part, so
+both can be tested without compiling the Delta write path.
 
 ### 2. Read
 
@@ -193,19 +204,32 @@ sequentially at line rate. Asynchrony would add complexity and provide no benefi
 Because the source is a delivered file rather than a spawned process, this module
 contains no subprocess handling, no credentials, and no connection strings.
 
-The dump arrives compressed. The compression format is detected from the file's leading
-magic bytes rather than from configuration or a file extension, so a change of format by
-the sender is handled rather than misread: `1f 8b` for gzip, `28 b5 2f fd` for zstd, and
-anything else treated as plain text. An unrecognised format fails the load.
+Compression is detected from the stream's leading magic bytes rather than from
+configuration or a file extension, so a change of format by the sender is handled rather
+than misread. Three outcomes are possible:
+
+- `1f 8b`, gzip, is decoded. `MultiGzDecoder` is used rather than `GzDecoder`, because a
+  concatenated archive would otherwise stop silently at the end of its first member,
+  which is a truncated load reported as success.
+- `28 b5 2f fd`, zstd, is **recognised but not decoded**, and fails the load with a
+  precise error. Support is not compiled in, and recognising the format is what turns a
+  corrupt parse into a clear message.
+- Anything else is treated as plain text, which is what the current feed delivers.
+
+Note the asymmetry: an *unrecognised* format is assumed to be plain text and will fail
+later in the scanner, whereas a *recognised but unsupported* one fails immediately. Adding
+zstd is a small change (one crate and one match arm), and should be made before asking the
+sender to switch, not after.
 
 **Decompression is the pipeline's only unavoidable serial stage.** A compressed stream
 must be decoded in order, so unlike row decoding it does not scale with cores, and it
 sits in front of every other stage. It therefore sets the floor on total runtime. Measured
 gunzip throughput is 349 MiB/s against a row decoder at 1068 MiB/s per core, so with gzip
 input the decompressor governs the run and is roughly three times the cost of the decode
-it feeds. zstd would run several times faster and would not be a constraint at all. Where the sender's format can be influenced, zstd should
-be requested. Where gzip is fixed, a faster backend such as zlib-ng is worth the build
-complexity, because no amount of parallelism elsewhere will compensate.
+it feeds. Where gzip is fixed, a faster backend such as zlib-ng is worth the build
+complexity, because no amount of parallelism elsewhere will compensate; it is available
+behind the `fast-gzip` feature. A plain-text feed avoids the stage altogether and is the
+case the current deployment is sized for.
 
 ### 3. Scan
 
@@ -300,12 +324,26 @@ can be cut at newline boundaries and the resulting pieces decoded independently.
 - **A.** The reader thread accumulates approximately 16 MB, then moves the cut back to the
   last newline in the buffer using a reverse `memchr`, carrying the remainder into the
   next chunk.
-- **B.** Each newline-aligned chunk is passed over a bounded channel to the decode pool.
-- **C.** Workers decode whole rows in parallel. By construction no row spans a chunk, so
-  workers never coordinate.
+- **B.** The scanner classifies each chunk. Only the row interiors of an open `COPY` block
+  leave the reader; DDL is handled in place.
+- **C.** Row bytes are handed round-robin, at chunk granularity, to one of `threads`
+  workers over a per-worker bounded channel.
+- **D.** Each worker decodes whole rows, builds Arrow batches, and **encodes Parquet into
+  its own writer**. By construction no row spans a chunk, so workers never coordinate over
+  data. Putting the Parquet encoder on the worker is what keeps the expected bottleneck off
+  a single thread.
+- **E.** At the end of a block the reader broadcasts a close and collects one
+  acknowledgement per worker, each carrying that worker's staged `Add` actions and its row
+  and substitution counts. Those are pooled and committed together in Phase 2.
 
 This requires a single pass, no seeking, and no second read of the file. Throughput
 scales with available cores.
+
+Round-robin at chunk granularity has a useful secondary property: a table smaller than one
+chunk is seen by exactly one worker and therefore produces exactly one file. Only tables
+large enough to span chunks fan out, which is precisely where several files are wanted.
+Were work distributed per row instead, every one of several hundred small tables would
+emit one small file per worker.
 
 Measured on synthetic COPY TEXT data carrying real entropy, at a 3.0x gzip ratio
 (`cargo run --release --example throughput`):
@@ -352,10 +390,16 @@ diagnose.
 ### 5. The Global Interpreter Lock
 
 The Python entry point is an ordinary blocking call. It wraps the entire run in
-`Python::allow_threads`, releasing the GIL so that other Python threads continue to run.
-The GIL is reacquired periodically to check for signals, so `KeyboardInterrupt`
-functions correctly. Progress callbacks reacquire the GIL for their duration and should
-therefore be inexpensive.
+`Python::detach`, releasing the GIL so that other Python threads continue to run. The
+method was named `Python::allow_threads` before PyO3 0.29 and is still described that way
+in much of the surrounding literature.
+
+The GIL is reacquired on every progress callback, which happens once per chunk and once
+per table, and each such reacquisition checks for signals so that `KeyboardInterrupt`
+works. Callbacks should therefore be inexpensive. A signal, or an exception raised by the
+caller's own callback, is restored as the pending Python exception and re-raised once the
+load has unwound, so the caller sees the exception they raised rather than a generic
+interrupt. Decode workers never touch Python.
 
 ### 6. Disadvantages
 
@@ -397,13 +441,24 @@ Peak memory is **O(1) in dump size**. A 480 GB dump costs the same footprint as 
 dump; only wall-clock time scales.
 
 ```
-batch_rows / batch_bytes  x  decode pool size  x  channel capacity
+threads x (batch_bytes + one Parquet write buffer)      the open block
+  + threads x queue depth x chunk size                  the decode queue
 ```
 
 [Figure 5-1] Determinants of peak memory
 
+Only one `COPY` block is open at a time, because the scanner is sequential, so the first
+term does not multiply by the table count. Neither term involves the size of the dump.
+
+The practical consequence is that `threads` and `batch_bytes` multiply. The default
+`batch_bytes` of 128 MB across sixteen workers is two gigabytes of builders before any
+Parquet buffer is counted, which is the figure to check first on a small driver. Lower
+`batch_bytes`, not `threads`, when memory is tight: batches are flushed by whichever bound
+is reached first, so a smaller byte bound costs nothing but more frequent flushes.
+
 To this are added hard caps on maximum field bytes, maximum row bytes, and maximum column
-count. A malformed or hostile dump must not exhaust the driver.
+count. A malformed or hostile dump must not exhaust the driver. The row cap additionally
+bounds how far the reader will grow a chunk around one very long line.
 
 ---
 
@@ -490,8 +545,8 @@ than if.
 | `bigint`, `int8` | `Int64` |
 | `real` | `Float32` |
 | `double precision` | `Float64` |
-| `numeric(p,s)` where p <= 38 | `Decimal128(p,s)` |
-| `numeric` unconstrained, or p > 38 | `Utf8` |
+| `numeric(p,s)` where 1 <= p <= 38 and 0 <= s <= p | `Decimal128(p,s)` |
+| `numeric` unconstrained, or outside that range | `Utf8` |
 | `boolean` | `Boolean` |
 | `date` | `Date32` |
 | `timestamp` | `Timestamp(Micros, None)` |
@@ -524,8 +579,16 @@ judgement rather than a fact:
   the infinities in `real` and `double precision` columns are preserved exactly, because
   IEEE 754 represents them.
 
-Both substitutions are **counted per column and reported in the run statistics**, so they
-are visible rather than silent. A column with a high `infinity` count is a signal that the
+A third degradation is structural rather than per value. PostgreSQL 15 and later accept a
+`numeric` whose scale is negative or exceeds its precision, such as `numeric(5,-2)` or
+`numeric(2,5)`. Arrow's `Decimal128` requires `0 <= scale <= precision <= 38`, so such a
+column is written as text in its entirety, and its values are preserved as the literal the
+dump carried. This is decided once, when the type is resolved, so the schema and the array
+builder cannot disagree; deciding it per value would produce a batch whose arrays did not
+match their own schema.
+
+Both per-value substitutions are **counted per column and reported in the run statistics**,
+so they are visible rather than silent. A column with a high `infinity` count is a signal that the
 source table wants a different mapping, and the honest fix is to declare it text.
 
 Text columns carrying bytes that are not valid UTF-8 **fail the load**. Arrow strings are
@@ -555,6 +618,11 @@ Security was the starting point of the design, not a review pass.
 - **B.** **Path-traversal guard on the table-to-path mapping.** `../` is a legal quoted
   PostgreSQL identifier. An attacker-controlled table name must not escape the output
   prefix. Validate and reject; never sanitise silently.
+- **B2.** **Schema and table are never joined into one string.** A dot is legal inside a
+  quoted identifier, so `public."a.b"` and schema `public.a` table `b` are
+  indistinguishable once joined, and would map to the same output path. The parts are
+  carried separately from the scanner through to the path mapping, and each is validated
+  on its own. A dot appearing inside an identifier is rejected rather than split.
 - **C.** **Bounded limits** on maximum field bytes, maximum row bytes, and maximum column
   count. These are the only barrier between a malformed dump and an out-of-memory driver.
 - **D.** **Never log row data.** Error messages identify positions and tables, never
@@ -604,6 +672,12 @@ credential-handling risk is absent by construction rather than by mitigation.
 - **Plain format only.** Custom-format archives are unsupported.
 - **Full load on every run.** There is no incremental or CDC path.
 - **Two concurrency models** in one codebase, as described in Chapter IV, Section 6.
+- **A `numeric` that Arrow cannot hold is silently written as text.** It is visible in the
+  resulting schema, but unlike an unrecognised type it is not called out in the run
+  statistics. See Chapter VIII, Section 2.
+- **Row order within a table is not preserved.** Each worker stages its own files. Delta
+  tables are unordered sets so this is correct, but a caller porting from a system that
+  happened to preserve insertion order should know.
 
 ### 3. Conditions under which this design is inappropriate
 
@@ -626,12 +700,24 @@ actively maintained crates.
 | `pyo3` | 0.29.2 | Python bindings | [docs.rs](https://docs.rs/pyo3/0.29.2/pyo3/), [crates.io](https://crates.io/crates/pyo3) |
 | `deltalake` | 0.32.4 | Delta write path; transitively supplies arrow, parquet, object_store, tokio, chrono | [docs.rs](https://docs.rs/deltalake/0.32.4/deltalake/), [crates.io](https://crates.io/crates/deltalake) |
 | `memchr` | 2.8.3 | SIMD scanning for newlines and tabs in the hot loop | [docs.rs](https://docs.rs/memchr/2.8.3/memchr/), [crates.io](https://crates.io/crates/memchr) |
+| `flate2` | 1.1.10 | gzip decoding. The default backend is pure Rust, so a wheel builds with no C toolchain | [docs.rs](https://docs.rs/flate2/1.1.10/flate2/), [crates.io](https://crates.io/crates/flate2) |
+| `tokio` | 1.53.1 | Runtime for the storage edge. Already in the `deltalake` tree; declared so `sink.rs` and `pipeline.rs` may name it | [docs.rs](https://docs.rs/tokio/1.53.1/tokio/), [crates.io](https://crates.io/crates/tokio) |
+| `futures` | 0.3.34 | Stream combinators over the Delta file listing. Already in the `deltalake` tree | [docs.rs](https://docs.rs/futures/0.3.34/futures/), [crates.io](https://crates.io/crates/futures) |
 
 Use the `deltalake::arrow` re-exports rather than depending on `arrow` directly, so as to
 avoid version skew against the arrow release that delta-rs pins.
 
 `/Volumes` FUSE paths require no object-store feature. `abfss://` requires the `azure`
 feature of `deltalake`.
+
+`tokio` and `futures` are pinned to the versions `deltalake` already resolves, so
+declaring them builds no duplicate copy.
+
+Three optional features are defined. `extension-module` links the Python extension against
+the interpreter that loads it and is enabled only for the wheel build, never for
+`cargo test`, which needs to link libpython. `fast-gzip` selects the zlib-ng backend and
+requires a C toolchain and cmake. `azure` adds the object-store backend for `abfss://`
+output, which a `/Volumes` FUSE path does not need.
 
 Deliberately excluded:
 

@@ -1,1 +1,12 @@
 /target
+
+# Python build and test artefacts from the mixed maturin layout.
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+/dist/
+*.egg-info/
+.venv/
+.mypy_cache/
+.pytest_cache/

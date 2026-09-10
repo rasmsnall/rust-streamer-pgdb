@@ -15,7 +15,7 @@ classifiers = [
 ]
 
 [project.urls]
-Source = "https://github.com/snall/rust-streamer-pgdb"
+Source = "https://github.com/rasmsnall/rust-streamer-pgdb"
 
 [tool.maturin]
 # The extension-module feature is off in Cargo.toml's default set so `cargo test` links

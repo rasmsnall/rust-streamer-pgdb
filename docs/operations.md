@@ -1,0 +1,466 @@
+# pgdelta: Operations
+
+**Document type** Operations manual
+**Status** Complete. Describes the system as built.
+**Audience** Whoever runs the daily load and is paged when it fails.
+**Companion documents** `architecture.md` for the design, `api.md` for the callable surface.
+**Version** 1.0
+**Date** 2026-09-10
+
+---
+
+## Contents
+
+- I. Introduction
+  - 1. Purpose
+  - 2. The workload
+- II. Deployment
+  - 1. Building the wheel
+  - 2. Installing on Databricks
+  - 3. Where output may be written
+  - 4. The compatibility floor
+- III. Sizing
+  - 1. What scales and what does not
+  - 2. Memory
+  - 3. Cores and threads
+  - 4. Expected runtime
+  - 5. Choosing a driver
+- IV. Storage Maintenance
+  - 1. Why storage grows
+  - 2. Scheduling VACUUM
+  - 3. Choosing a retention window
+- V. Failure and Recovery
+  - 1. What a failure leaves behind
+  - 2. Re-running a failed load
+  - 3. Diagnosing by exception
+  - 4. Failures that need the sender
+- VI. Monitoring
+  - 1. What to record every run
+  - 2. What should page someone
+- VII. Change Management
+  - 1. A new PostgreSQL major
+  - 2. Schema drift
+  - 3. A table that disappears
+- References
+- Appendix A. Runbook
+- Appendix B. Known gaps
+
+### List of Tables
+
+- `<Table 2-1>` Output location options
+- `<Table 3-1>` Measured stage throughput
+- `<Table 3-2>` Indicative runtimes
+- `<Table 5-1>` Exception to first action
+- `<Table 6-1>` Values worth recording per run
+- `<Table B-1>` Known gaps
+
+### List of Figures
+
+- `[Figure 3-1]` Peak memory
+- `[Figure 5-1]` State after a failed run
+
+---
+
+## I. Introduction
+
+### 1. Purpose
+
+This document covers running `pgdelta` in production: how to deploy it, how to size the
+machine, what maintenance it requires, and what to do when it fails. It assumes the
+architecture is not of interest until something goes wrong.
+
+### 2. The workload
+
+The system this was built for receives one plain-text `pg_dump` per day from a third
+party. As measured in September 2026:
+
+- Roughly 48 GB, uncompressed, and growing.
+- Around 450 tables. The count varies between dumps, which is itself evidence that the
+  table set drifts.
+- The largest table is about 60 million rows, the second about 13 million. The remaining
+  hundreds are comparatively small.
+
+Two consequences follow, and both shape everything below. First, per-table commit overhead
+rather than decoding dominates the tail of the run. Second, there is no network access to
+the source database, so the dump preamble is the only version signal available.
+
+---
+
+## II. Deployment
+
+### 1. Building the wheel
+
+The package builds as an `abi3` wheel: one artefact loads on CPython 3.10 and later
+without recompilation.
+
+```
+pip install maturin
+maturin build --release
+```
+
+The wheel lands in `target/wheels/`. Build it on the same platform family as the cluster;
+an `abi3` wheel is portable across Python versions, not across operating systems or
+architectures.
+
+The release profile enables thin LTO and a single codegen unit. A debug build decodes
+roughly an order of magnitude slower and is not representative of anything.
+
+Two optional features exist. `fast-gzip` selects the zlib-ng backend, which is materially
+faster but requires a C toolchain and cmake at build time; it is worth enabling only if
+the feed is gzipped. `azure` adds the object-store backend needed for `abfss://` output. A
+`/Volumes` FUSE path needs neither.
+
+### 2. Installing on Databricks
+
+Install the wheel on the cluster, or as a job-scoped library. The load runs entirely on
+the **driver**: it is a single-node design and executors are not used. Sizing the cluster
+therefore means sizing the driver, and a large worker pool is wasted money.
+
+### 3. Where output may be written
+
+`<Table 2-1>` Output location options
+
+| Target | Supported | Notes |
+|---|---|---|
+| `/Volumes/...` FUSE path | Yes | Simplest. Needs no object-store feature |
+| External location, `abfss://` | Yes | Requires the `azure` feature and `storage_options` |
+| Unity Catalog **managed** table | **No** | Do not do this |
+
+Never write to a Unity Catalog managed table. Managed tables assume Databricks is the only
+writer; a third-party writer can corrupt them, and the failure mode is not a clean error.
+Use an external location or a Volume, and register the result if a catalog entry is
+wanted.
+
+### 4. The compatibility floor
+
+Tables are created at Delta **reader version 1 and writer version 2**, with no deletion
+vectors and no column mapping, so any Databricks Runtime can read the output. This is a
+deliberate constraint and a test asserts it, because a delta-rs upgrade could otherwise
+raise the default silently.
+
+The visible cost is that naive PostgreSQL timestamps are assumed to be UTC rather than
+written as `timestamp_ntz`, which would require reader version 3 and writer version 7. See
+`api.md`, Chapter V, Section 4.
+
+---
+
+## III. Sizing
+
+### 1. What scales and what does not
+
+Peak memory is **O(1) in dump size**. A 480 GB dump costs the same footprint as a 48 GB
+one. Only wall-clock time scales, and that is what sizing is about.
+
+### 2. Memory
+
+```
+threads x (batch_bytes + one Parquet write buffer)      the open block
+  + threads x queue depth x chunk size                  the decode queue
+```
+
+[Figure 3-1] Peak memory
+
+Only one `COPY` block is open at a time, so the first term does not multiply by the table
+count. With the defaults on a sixteen-core driver, `threads` is 16 and `batch_bytes` is
+128 MB, which reserves about two gigabytes of builders before Parquet buffers are counted.
+The decode queue adds roughly `16 x 3 x 16 MB`, another three quarters of a gigabyte.
+
+**`threads` and `batch_bytes` multiply.** When memory is tight, lower `batch_bytes`
+first. Batches flush on whichever bound is reached first, so a smaller byte bound costs
+only more frequent flushes, whereas fewer threads costs throughput directly.
+
+### 3. Cores and threads
+
+`threads` defaults to the machine's parallelism. Lower it when the driver is shared with
+other work, or when memory is constrained and lowering `batch_bytes` was not enough.
+
+Raising it above the core count achieves nothing: the workers are CPU-bound on decoding
+and Parquet encoding, not waiting on anything.
+
+### 4. Expected runtime
+
+`<Table 3-1>` Measured stage throughput
+
+Measured on synthetic COPY TEXT data carrying realistic entropy, at a 3.0x gzip ratio, via
+`cargo run --release --example throughput`.
+
+| Stage | Rate | Scales with cores |
+|---|---|---|
+| gunzip | 349 MiB/s | No, inherently serial |
+| Row decode | 1068 MiB/s per core | Yes |
+| Scan | 8681 MiB/s | No, but negligible |
+
+`<Table 3-2>` Indicative runtimes
+
+| Dump | Plain input | gzip input |
+|---|---|---|
+| 48 GB | Bounded by Parquet encode and upload | 2.3 min of gunzip alone, serial |
+| 480 GB | As above, ten times longer | 23.5 min of gunzip alone, serial |
+
+Read those figures carefully. **With gzip input the decompressor governs the run**: one
+decode thread already outpaces it three to one, so the decode pool exists to remove a
+single-core ceiling and to absorb a future format change, not because decoding is scarce.
+With plain input, which is what the current feed delivers, the decompression stage
+disappears entirely and Parquet encoding becomes the constraint, which is exactly the
+stage the worker pool parallelises.
+
+### 5. Choosing a driver
+
+Prefer cores and memory on the driver over any worker allocation. A memory-optimised
+single node is the right shape. Start with the defaults, record peak memory from the first
+few runs, and lower `batch_bytes` if the headroom is uncomfortable.
+
+---
+
+## IV. Storage Maintenance
+
+### 1. Why storage grows
+
+Two mechanisms add files that are invisible to readers but still billed.
+
+- **Overwrites tombstone.** A daily full overwrite marks the previous run's files removed
+  in the transaction log. The files persist until `VACUUM`. Across roughly 450 tables,
+  every day, this accumulates quickly.
+- **Failed runs orphan.** A load that fails in Phase 1 leaves every Parquet file it had
+  written up to that point, referenced by nothing. At 480 GB a late failure orphans a
+  large number of dead bytes.
+
+Neither is visible to a query. Both are visible on the invoice.
+
+### 2. Scheduling VACUUM
+
+`VACUUM` is **not optional** and nothing in this library runs it. Schedule it explicitly
+across every table beneath the output prefix.
+
+```sql
+VACUUM delta.`/Volumes/main/raw/pg/public/users` RETAIN 168 HOURS;
+```
+
+Iterate over the tables the load reports rather than over a hard-coded list, since the
+table set drifts:
+
+```python
+for stats in report.tables:
+    path = f"{output_uri.rstrip('/')}/{stats.table.replace('.', '/')}"
+    spark.sql(f"VACUUM delta.`{path}` RETAIN 168 HOURS")
+```
+
+Run it after a successful load, not before, and not concurrently with one.
+
+### 3. Choosing a retention window
+
+The default retention is seven days, and lowering it below that requires overriding a
+safety check that exists to protect concurrent readers. Seven days is a reasonable
+starting point here: it is longer than the daily cadence, so a run can always be compared
+against yesterday, and short enough that storage does not compound.
+
+Shorten it only if storage cost demands it and you are certain no long-running reader or
+time-travel query depends on the window.
+
+---
+
+## V. Failure and Recovery
+
+### 1. What a failure leaves behind
+
+```
+Phase 1 fails  ->  orphaned Parquet, no commits, every table unchanged
+Phase 2 fails  ->  some tables at the new version, some at the old
+```
+
+[Figure 5-1] State after a failed run
+
+This is the property that makes recovery simple. The load is two-phase: the entire dump is
+decoded and staged with **nothing committed**, and only once the stream has been consumed
+cleanly is every table committed. A failure during the long decode phase therefore leaves
+no visible change at all.
+
+Phase 2 is a metadata-only burst at the very end, and it is the only window in which a
+partial result is observable. It is short, and it is the least failure-prone part of the
+pipeline, but it is not atomic across tables. Delta has no cross-table transaction. If
+strict cross-table atomicity is ever required, the pattern is a manifest table, discussed
+in `architecture.md`, Chapter VI, Section 1.
+
+### 2. Re-running a failed load
+
+**Simply run it again.** In `overwrite` mode the load is idempotent: a re-run replaces
+whatever the previous attempt left, and the previous attempt committed nothing.
+
+There is no cleanup step and no state to reset. The orphaned files from the failed attempt
+are collected by the next `VACUUM`.
+
+The one case needing thought is a failure partway through Phase 2, which leaves some
+tables new and some old. Re-running fixes it, because every table is rewritten from the
+same dump. Do not attempt to re-run only the tables that failed unless you still have that
+day's dump and are certain of which ones they were.
+
+### 3. Diagnosing by exception
+
+`<Table 5-1>` Exception to first action
+
+| Exception | Likely cause | First action |
+|---|---|---|
+| `ValueError`, unterminated `COPY` | The transfer was truncated | Check the delivered file size against what the sender reports. Re-fetch |
+| `ValueError`, unqualified `pg_dump` major | The sender upgraded PostgreSQL | See Chapter VII, Section 1. Do not simply raise `expect_pg_major` |
+| `ValueError`, field count mismatch | The dump is malformed or the DDL was misparsed | Capture the table name and raise it with the sender. This is not tuneable |
+| `ValueError`, unsafe table name | A table name contains a character the path mapping rejects | See `api.md`, Chapter V, Section 3 |
+| `ValueError`, field or row too large | A legitimately wide row, or a hostile dump | Raise `max_field_bytes` or `max_row_bytes` only after confirming the row is genuine |
+| `RuntimeError`, delta error | Storage, permissions, or a concurrent writer | Check credentials and that nothing else writes to the prefix |
+| `RuntimeError`, internal invariant | A defect in this library | File it with the table name. Do not retry blindly |
+| `OSError` | The dump is missing or unreadable | Check the landing path and permissions |
+| `KeyboardInterrupt` | Cancelled, or the job timed out | Nothing was committed. Re-run |
+
+### 4. Failures that need the sender
+
+Three failures are not fixable on this side, and recognising them quickly saves hours:
+
+- A truncated `COPY` block means the file is incomplete. Plain dumps carry no row counts,
+  so this structural check is the only truncation detector there is.
+- A field count mismatch means the dump contradicts its own DDL.
+- A text column carrying bytes that are not valid UTF-8 means the source database has an
+  encoding problem. Arrow strings are UTF-8, and substituting replacement characters would
+  corrupt the values silently, so the load fails instead.
+
+---
+
+## VI. Monitoring
+
+### 1. What to record every run
+
+`<Table 6-1>` Values worth recording per run
+
+| Value | Why |
+|---|---|
+| `report.dumped_by`, `report.from_database` | The only version signal a plain dump carries. Answers "what changed" after the fact |
+| `report.bytes_read` | Compare against the delivered file size. A mismatch means truncation |
+| `report.total_rows` | Compare against yesterday. A large drop is a signal even when the load succeeded |
+| `len(report.tables)` | The table set drifts. A change is worth knowing about |
+| Per-table `rows` | Where a drop actually happened |
+| Per-table `text_fallback_columns` | A new entry means the sender introduced a type this build does not recognise |
+| Per-table `null_substitutions` | A rising count means a column wants a different mapping |
+| Wall-clock duration | The trend matters more than any single run |
+
+### 2. What should page someone
+
+Page on a failed load, since the day's data is missing and the window to re-fetch from the
+sender may be limited.
+
+Alert, without paging, on a row count that moves by more than an expected margin against
+the previous run, on a change in the table count, and on a new `text_fallback_columns`
+entry. None of these is an error, and all three are how schema drift announces itself.
+
+Do not alert on `null_substitutions` alone unless the count is rising run over run.
+
+---
+
+## VII. Change Management
+
+### 1. A new PostgreSQL major
+
+Set `expect_pg_major` on every scheduled run. When the sender upgrades, the load fails
+immediately and loudly rather than parsing an unfamiliar dialect speculatively and
+committing something subtly wrong.
+
+When that failure arrives, the correct response is **not** to raise the number and re-run.
+It is to qualify the new major: check the new `pg_dump` output for DDL constructs the
+scanner does not handle, add the major to `SUPPORTED_MAJORS` in `scan.rs`, extend the
+tests, and release a new wheel. COPY TEXT itself is stable across majors, so the risk is
+concentrated in DDL, which is exactly what the tripwire protects.
+
+### 2. Schema drift
+
+The sender controls the schema and will change it without notice. Three cases behave
+differently.
+
+- **A new column** appears in both the `CREATE TABLE` and the `COPY` header, so it is
+  picked up automatically. In `overwrite` mode the Delta schema is replaced along with the
+  data. In `append` mode a schema mismatch will fail the write.
+- **A new type** this build does not recognise degrades to text and shows up in
+  `text_fallback_columns`. The load succeeds. Decide later whether the type deserves a real
+  mapping.
+- **A removed column** simply stops appearing. In `overwrite` mode the new schema no longer
+  has it. Downstream queries referencing it will break, which is the correct outcome and is
+  why the table count and column set are worth monitoring.
+
+### 3. A table that disappears
+
+A table absent from today's dump is not loaded, and its Delta table is **left exactly as
+it was**. It is not emptied and not deleted, so it silently becomes stale.
+
+Nothing in the library detects this. Compare `report.tables` against the previous run and
+decide deliberately: mark it stale, drop it, or accept it. This is the most likely way for
+a downstream consumer to be quietly served yesterday's data, and it is called out in
+Appendix B for that reason.
+
+---
+
+## References
+
+1. Databricks. *VACUUM*.
+   https://docs.databricks.com/aws/en/sql/language-manual/delta-vacuum
+2. Databricks. *External locations*.
+   https://docs.databricks.com/aws/en/connect/unity-catalog/external-locations
+3. Databricks. *Unity Catalog managed tables*.
+   https://docs.databricks.com/aws/en/tables/managed
+4. Databricks. *Volumes*. https://docs.databricks.com/aws/en/volumes/
+5. Delta Lake Project. *Delta Transaction Log Protocol*.
+   https://github.com/delta-io/delta/blob/master/PROTOCOL.md
+6. PostgreSQL Global Development Group. *pg_dump*, PostgreSQL 17 Documentation.
+   https://www.postgresql.org/docs/17/app-pgdump.html
+7. maturin Project. *maturin User Guide*. https://www.maturin.rs/
+8. zlib-ng Project. *zlib-ng*. https://github.com/zlib-ng/zlib-ng
+
+---
+
+## Appendix A. Runbook
+
+The daily job, reduced to its essentials.
+
+```python
+import pgdelta
+
+DUMP = "/Volumes/main/landing/pg/day.sql"
+OUTPUT = "/Volumes/main/raw/pg/"
+
+report = pgdelta.stream_dump_to_delta(
+    DUMP,
+    OUTPUT,
+    mode="overwrite",
+    expect_pg_major=17,
+)
+
+# Record these. They are the whole audit trail.
+print(f"pg_dump {report.dumped_by}, server {report.from_database}")
+print(f"{report.bytes_read:,} bytes, {report.total_rows:,} rows, {len(report.tables)} tables")
+
+for stats in report.tables:
+    if stats.text_fallback_columns:
+        print(f"NEW UNRECOGNISED TYPE {stats.table}: {stats.text_fallback_columns}")
+
+# Only after success.
+for stats in report.tables:
+    path = f"{OUTPUT.rstrip('/')}/{stats.table.replace('.', '/')}"
+    spark.sql(f"VACUUM delta.`{path}` RETAIN 168 HOURS")
+```
+
+On failure: read the exception, consult Chapter V, Section 3, and in almost every case
+re-run once the underlying cause is addressed. Nothing needs cleaning up first.
+
+---
+
+## Appendix B. Known gaps
+
+Stated plainly, so that nobody discovers them during an incident.
+
+`<Table B-1>` Known gaps
+
+| Gap | Consequence | Mitigation |
+|---|---|---|
+| A table absent from the dump is left untouched | It silently serves stale data | Compare `report.tables` run over run. See Chapter VII, Section 3 |
+| Phase 2 is not atomic across tables | A reader during the commit burst may see a mix of two days | Accept, or adopt the manifest-table pattern |
+| `VACUUM` is not run by the library | Storage grows quietly | Schedule it. See Chapter IV |
+| A `numeric` outside Arrow's decimal range becomes text without being reported | Visible only in the resulting schema | Check the schema when a numeric column reads as a string |
+| Row order within a table is not preserved | Any consumer relying on insertion order breaks | Sort downstream. Delta tables are unordered sets |
+| A name in `tables` that never appears is not reported | A silent typo loads nothing | Compare your list against `report.tables` |
+| zstd input is rejected rather than decoded | A format change by the sender fails the load | Add the crate and a match arm before agreeing to any such change |
+| Single-node only | Ceiling in the high hundreds of gigabytes | See `architecture.md`, Chapter IV, Section 8 |
