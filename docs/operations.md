@@ -275,6 +275,11 @@ decoded and staged with **nothing committed**, and only once the stream has been
 cleanly is every table committed. A failure during the long decode phase therefore leaves
 no visible change at all.
 
+A failure in that burst raises `PartialCommitError`, which carries `committed` and
+`total`. Those two numbers are the whole diagnosis: `committed == 0` means nothing became
+visible and the situation is identical to a Phase 1 failure, while any larger value means
+that many tables are on the new day and the rest are not.
+
 Phase 2 is a metadata-only burst at the very end, and it is the only window in which a
 partial result is observable. It is short, and it is the least failure-prone part of the
 pipeline, but it is not atomic across tables. Delta has no cross-table transaction. If
@@ -306,6 +311,8 @@ day's dump and are certain of which ones they were.
 | `ValueError`, field count mismatch | The dump is malformed or the DDL was misparsed | Capture the table name and raise it with the sender. This is not tuneable |
 | `ValueError`, unsafe table name | A table name contains a character the path mapping rejects | See `api.md`, Chapter V, Section 3 |
 | `ValueError`, field or row too large | A legitimately wide row, or a hostile dump | Raise `max_field_bytes` or `max_row_bytes` only after confirming the row is genuine |
+| `PartialCommitError`, `committed` is 0 | The commit burst failed on its first table | Nothing became visible. Fix the cause and re-run |
+| `PartialCommitError`, `committed` above 0 | The commit burst failed part way | `committed` tables are on the new day, the rest on the old. Re-run as soon as the cause is fixed |
 | `RuntimeError`, delta error | Storage, permissions, or a concurrent writer | Check credentials and that nothing else writes to the prefix |
 | `RuntimeError`, internal invariant | A defect in this library | File it with the table name. Do not retry blindly |
 | `OSError` | The dump is missing or unreadable | Check the landing path and permissions |
@@ -332,6 +339,7 @@ Three failures are not fixable on this side, and recognising them quickly saves 
 
 | Value | Why |
 |---|---|
+| Whether `PartialCommitError` was raised, and its `committed` count | The only signal that a failed run left visible change |
 | `report.dumped_by`, `report.from_database` | The only version signal a plain dump carries. Answers "what changed" after the fact |
 | `report.bytes_read` | Compare against the delivered file size. A mismatch means truncation |
 | `report.total_rows` | Compare against yesterday. A large drop is a signal even when the load succeeded |

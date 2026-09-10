@@ -102,9 +102,9 @@ import pgdelta
 pgdelta.stream_dump_to_delta(...)
 ```
 
-The package exports exactly three names: `stream_dump_to_delta`, `LoadReport` and
-`TableStats`. Type stubs and a `py.typed` marker ship with the wheel, so `mypy` and
-`pyright` resolve the surface without configuration.
+The package exports exactly four names: `stream_dump_to_delta`, `LoadReport`,
+`TableStats` and `PartialCommitError`. Type stubs and a `py.typed` marker ship with the
+wheel, so `mypy` and `pyright` resolve the surface without configuration.
 
 ### 2. `stream_dump_to_delta`
 
@@ -198,6 +198,7 @@ raises.
 | Exception | Cause |
 |---|---|
 | `ValueError` | The dump is wrong: a truncated `COPY` block, a row whose field count disagrees with its header, a bad escape, a value contradicting its column type, an unqualified or mismatched `pg_dump` major, or a table name that would escape the prefix |
+| `PartialCommitError` | A commit failed part way through the final burst. **The only failure that can leave visible change behind.** Subclasses `RuntimeError` |
 | `RuntimeError` | The Delta or Arrow write path failed, or an internal invariant of the library was violated |
 | `OSError` | The dump could not be read |
 | `KeyboardInterrupt` | The load was interrupted by a signal |
@@ -210,7 +211,29 @@ If the progress callback itself raises, **that exception propagates unchanged**,
 than being replaced by a generic interrupt. A callback that raises `ValueError` after two
 hours of decoding reports its own message, not `KeyboardInterrupt`.
 
-In every failing case, nothing has been committed. See `operations.md`, Chapter V.
+In every failing case except `PartialCommitError`, nothing has been committed.
+
+`PartialCommitError` is the exception to that, and the reason it has its own type. It
+carries three attributes so the caller need not parse the message:
+
+| Attribute | Meaning |
+|---|---|
+| `table` | Qualified name of the table whose commit failed |
+| `committed` | Tables committed before the failure. **Zero means nothing became visible** |
+| `total` | Tables that were to be committed |
+
+```python
+try:
+    report = pgdelta.stream_dump_to_delta(dump, output)
+except pgdelta.PartialCommitError as exc:
+    if exc.committed:
+        alert(f"{exc.committed} of {exc.total} tables are on the new day; re-run")
+    else:
+        alert("commit failed before anything became visible; safe to re-run")
+```
+
+It subclasses `RuntimeError`, so a handler written without knowing about it still catches
+it. See `operations.md`, Chapter V.
 
 ### 6. The progress callback
 

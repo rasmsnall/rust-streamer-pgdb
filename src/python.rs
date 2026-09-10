@@ -11,6 +11,7 @@ use std::collections::HashMap;
 
 use pyo3::exceptions::{PyIOError, PyKeyboardInterrupt, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::create_exception;
 use pyo3::types::PyDict;
 
 use crate::copy::Limits;
@@ -18,12 +19,35 @@ use crate::error::Error;
 use crate::pipeline::{self, LoadConfig, LoadReport, Progress, TableStats};
 use crate::sink::WriteMode;
 
+create_exception!(
+    _pgdelta,
+    PartialCommitError,
+    PyRuntimeError,
+    "A commit failed after some tables had already been committed. \
+     Delta has no cross-table transaction, so the target now holds a mixture of this run \
+     and the previous one. Carries table, committed and total attributes saying how far \
+     the burst got. Re-run to restore consistency: overwrite rewrites every table from \
+     the same dump. Subclasses RuntimeError, so existing handlers still catch it."
+);
+
 /// Registers everything the extension module exposes.
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(stream_dump_to_delta, module)?)?;
     module.add_class::<PyLoadReport>()?;
     module.add_class::<PyTableStats>()?;
-    module.add("__all__", ("stream_dump_to_delta", "LoadReport", "TableStats"))?;
+    module.add(
+        "PartialCommitError",
+        module.py().get_type::<PartialCommitError>(),
+    )?;
+    module.add(
+        "__all__",
+        (
+            "stream_dump_to_delta",
+            "LoadReport",
+            "TableStats",
+            "PartialCommitError",
+        ),
+    )?;
     Ok(())
 }
 
@@ -31,11 +55,30 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
 ///
 /// `ValueError` is the default because most variants describe a dump that is wrong.
 /// Faults that are ours rather than the dump's raise `RuntimeError` instead.
-fn to_pyerr(err: Error) -> PyErr {
+///
+/// [`Error::CommitFailed`] gets its own type, because it is the only failure that can
+/// leave visible change behind, and a caller may want to handle it differently from every
+/// other kind. Its counts are attached as attributes so they need not be parsed out of the
+/// message.
+fn to_pyerr(py: Python<'_>, err: Error) -> PyErr {
     let message = err.to_string();
     match err {
         Error::Interrupted => PyKeyboardInterrupt::new_err(message),
         Error::Io { .. } => PyIOError::new_err(message),
+        Error::CommitFailed {
+            table,
+            committed,
+            total,
+            ..
+        } => {
+            let raised = PartialCommitError::new_err(message);
+            let value = raised.value(py);
+            // Best effort: a failure to attach these must not mask the error itself.
+            let _ = value.setattr("table", table);
+            let _ = value.setattr("committed", committed);
+            let _ = value.setattr("total", total);
+            raised
+        }
         Error::Delta { .. } | Error::Arrow { .. } | Error::Internal { .. } => {
             PyRuntimeError::new_err(message)
         }
@@ -181,8 +224,13 @@ fn parse_mode(mode: &str) -> PyResult<WriteMode> {
 ///     with its ``COPY`` header, a bad escape, a value that contradicts its column type,
 ///     an unqualified or mismatched ``pg_dump`` major, or a table name that escapes the
 ///     prefix.
+/// PartialCommitError
+///     A commit failed part way through the final burst, so some tables hold this run's
+///     contents and the rest hold the previous run's. Carries ``table``, ``committed`` and
+///     ``total``. This is the only failure that can leave visible change behind.
+///     Subclasses ``RuntimeError``.
 /// RuntimeError
-///     The Delta or Arrow write path failed.
+///     The Delta or Arrow write path failed, or an internal invariant was violated.
 /// OSError
 ///     The dump could not be read.
 /// KeyboardInterrupt
@@ -286,7 +334,7 @@ fn stream_dump_to_delta(
     if let Some(err) = PyErr::take(py) {
         return Err(err);
     }
-    let report: LoadReport = outcome.map_err(to_pyerr)?;
+    let report: LoadReport = outcome.map_err(|err| to_pyerr(py, err))?;
 
     let tables = report
         .tables

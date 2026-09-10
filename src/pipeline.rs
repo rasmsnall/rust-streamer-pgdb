@@ -700,9 +700,21 @@ where
     let dumped_by = dumped_by.ok_or(Error::MissingDumpVersion)?;
 
     // Phase two. Nothing above committed anything; every table becomes visible now.
-    for (name, delta_table) in &mut open_tables {
+    //
+    // This burst is the only part of the load that is not atomic, because Delta has no
+    // cross-table transaction. A failure here is reported with how far it got, so an
+    // operator can tell "nothing changed" from "the first n tables changed".
+    let total = open_tables.len();
+    for (committed, (name, delta_table)) in open_tables.iter_mut().enumerate() {
         let actions = staged.remove(name).unwrap_or_default();
-        let version = handle.block_on(commit_table(delta_table, actions, config.mode))?;
+        let version = handle
+            .block_on(commit_table(delta_table, actions, config.mode))
+            .map_err(|err| Error::CommitFailed {
+                table: name.clone(),
+                committed,
+                total,
+                message: err.to_string(),
+            })?;
         if let Some(stat) = tables.iter_mut().find(|t| &t.table == name) {
             stat.delta_version = version;
         }

@@ -174,6 +174,27 @@ pub enum Error {
     /// made visible. Nothing has been staged that a later run cannot overwrite.
     Interrupted,
 
+    /// A phase-two commit failed part way through the burst.
+    ///
+    /// This is the one variant that may mean the load left **visible change** behind.
+    /// Delta has no cross-table transaction, so the tables committed before the failure
+    /// hold the new contents while the rest still hold the previous run's. The counts are
+    /// carried so an operator can tell that apart from a failure on the very first table,
+    /// which changed nothing.
+    ///
+    /// Re-running under [`WriteMode::Overwrite`](crate::sink::WriteMode) restores
+    /// consistency, because every table is rewritten from the same dump.
+    CommitFailed {
+        /// Qualified name of the table whose commit failed.
+        table: String,
+        /// Tables committed successfully before the failure.
+        committed: usize,
+        /// Tables that were to be committed in this phase.
+        total: usize,
+        /// Display form of the underlying failure.
+        message: String,
+    },
+
     /// An invariant between two stages of this crate was violated.
     ///
     /// Indicates a defect here rather than a problem with the dump. It is an error and
@@ -236,6 +257,28 @@ impl fmt::Display for Error {
             }
             Error::Io { message } => write!(f, "io error: {message}"),
             Error::Interrupted => f.write_str("load interrupted by caller"),
+            Error::CommitFailed {
+                table,
+                committed,
+                total,
+                message,
+            } => {
+                if *committed == 0 {
+                    write!(
+                        f,
+                        "commit failed on table {table}, the first of {total}, \
+                         so no table changed: {message}"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "commit failed on table {table} after {committed} of {total} \
+                         tables were committed, so those {committed} now hold the new \
+                         contents and the rest hold the previous run's; re-run to restore \
+                         consistency: {message}"
+                    )
+                }
+            }
             Error::Internal { detail } => write!(f, "internal invariant violated: {detail}"),
         }
     }
@@ -248,5 +291,51 @@ impl From<std::io::Error> for Error {
         Error::Io {
             message: e.to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The distinction the counts exist to make: a failure on the first table changed
+    /// nothing, and a failure later did. An operator reads this at three in the morning,
+    /// so both cases must be unambiguous.
+    #[test]
+    fn commit_failure_says_whether_anything_became_visible() {
+        let first = Error::CommitFailed {
+            table: "public.users".into(),
+            committed: 0,
+            total: 450,
+            message: "storage unavailable".into(),
+        };
+        let rendered = first.to_string();
+        assert!(rendered.contains("no table changed"), "{rendered}");
+        assert!(rendered.contains("public.users"));
+        assert!(rendered.contains("storage unavailable"));
+
+        let partway = Error::CommitFailed {
+            table: "public.orders".into(),
+            committed: 12,
+            total: 450,
+            message: "storage unavailable".into(),
+        };
+        let rendered = partway.to_string();
+        assert!(rendered.contains("12 of 450"), "{rendered}");
+        assert!(rendered.contains("re-run"), "{rendered}");
+        assert!(!rendered.contains("no table changed"), "{rendered}");
+    }
+
+    /// Error text reaches logs and Python tracebacks, and the dump is untrusted, so no
+    /// variant may carry field contents. Table names are schema identifiers, not row data.
+    #[test]
+    fn no_variant_carries_row_data() {
+        let err = Error::UnparsableValue {
+            column: "amount".into(),
+            expected: "integer",
+        };
+        let rendered = err.to_string();
+        assert!(rendered.contains("amount"));
+        assert!(rendered.contains("integer"));
     }
 }
