@@ -1,0 +1,54 @@
+[package]
+name = "pgdelta"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "Stream pg_dump plain-text output directly into Delta Lake tables"
+license = "MIT"
+publish = false
+
+[lib]
+name = "pgdelta"
+path = "src/lib.rs"
+# cdylib for the Python extension module; rlib so the crate's own tests and the
+# throughput example can link it.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Python bindings. abi3-py310 builds one wheel that loads on CPython 3.10 and later.
+# The extension-module feature is enabled only for the wheel build (see pyproject.toml),
+# never for `cargo test`, which needs to link libpython.
+pyo3 = { version = "0.29.2", features = ["abi3-py310"] }
+
+# SIMD scanning for newlines and tabs in the hot row loop.
+memchr = "2.8.3"
+
+# gzip decoding. Default backend is pure Rust (miniz_oxide), so a wheel builds with no C
+# toolchain. Decompression is the pipeline's serial floor, so where a toolchain is
+# available, build with --features fast-gzip for the zlib-ng backend.
+flate2 = "1.1.10"
+
+# Delta write path. Arrow, parquet, object_store and tokio arrive transitively; use the
+# deltalake::arrow re-export rather than a direct arrow dependency, to avoid version skew
+# against the arrow release delta-rs pins.
+deltalake = "0.32.4"
+
+# Already compiled as part of the deltalake tree; declared so sink.rs can name them.
+# Pinned to the versions deltalake already resolves, so no duplicate copy is built.
+tokio = { version = "1.53.1", features = ["rt", "rt-multi-thread"] }
+futures = "0.3.34"
+
+[features]
+default = []
+# Links the extension module against the Python interpreter that loads it, rather than
+# libpython. Enabled by the wheel build; must stay off for `cargo test`.
+extension-module = ["pyo3/extension-module"]
+# Faster gzip via zlib-ng. Requires a C toolchain and cmake at build time.
+fast-gzip = ["flate2/zlib-ng"]
+# Azure object store, for abfss:// output. Not needed for /Volumes FUSE paths.
+azure = ["deltalake/azure"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

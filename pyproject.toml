@@ -1,0 +1,26 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "pgdelta"
+version = "0.1.0"
+description = "Stream pg_dump plain-text output directly into Delta Lake tables"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Database",
+]
+
+[project.urls]
+Source = "https://github.com/snall/rust-streamer-pgdb"
+
+[tool.maturin]
+# The extension-module feature is off in Cargo.toml's default set so `cargo test` links
+# libpython; the wheel build turns it on here. abi3 comes from the always-on pyo3 feature.
+features = ["extension-module"]
+module-name = "pgdelta._pgdelta"
+python-source = "python"
+strip = true
