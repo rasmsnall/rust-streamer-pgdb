@@ -28,12 +28,17 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 /// Maps a crate error onto the closest Python exception.
+///
+/// `ValueError` is the default because most variants describe a dump that is wrong.
+/// Faults that are ours rather than the dump's raise `RuntimeError` instead.
 fn to_pyerr(err: Error) -> PyErr {
     let message = err.to_string();
     match err {
         Error::Interrupted => PyKeyboardInterrupt::new_err(message),
         Error::Io { .. } => PyIOError::new_err(message),
-        Error::Delta { .. } | Error::Arrow { .. } => PyRuntimeError::new_err(message),
+        Error::Delta { .. } | Error::Arrow { .. } | Error::Internal { .. } => {
+            PyRuntimeError::new_err(message)
+        }
         _ => PyValueError::new_err(message),
     }
 }
@@ -88,7 +93,7 @@ pub struct PyLoadReport {
     from_database: Option<u32>,
     /// Compression decoded off the input, or `"none"`.
     compression: String,
-    /// Compressed bytes read from the input.
+    /// Bytes taken from the input, counted before decompression.
     bytes_read: u64,
     /// Rows decoded across every loaded table.
     total_rows: u64,
@@ -153,7 +158,9 @@ fn parse_mode(mode: &str) -> PyResult<WriteMode> {
 ///     Override the decode limits that protect the driver from a hostile dump.
 /// progress : callable | None
 ///     Called with a dict ``{bytes_read, rows, tables_done, table}`` after each chunk and
-///     each table. Raising from it, or a Ctrl-C, aborts the load before any commit.
+///     each table. ``bytes_read`` counts the input before decompression, so it is
+///     comparable with the file size. Raising from it, or a Ctrl-C, aborts the load before
+///     any commit; the exception raised is the one that propagates.
 ///
 /// Returns
 /// -------
@@ -234,29 +241,46 @@ fn stream_dump_to_delta(
 
     // The callback runs on the calling thread with the GIL held. It reports progress and,
     // by re-checking signals, lets Ctrl-C stop a load that would otherwise run for hours.
-    // Returning false aborts with Error::Interrupted, which becomes KeyboardInterrupt.
+    // Returning false aborts with Error::Interrupted.
+    //
+    // A signal, or an exception raised by the caller's callback, is restored as the
+    // pending Python exception rather than discarded, and picked back up below. Reporting
+    // every abort as a bare KeyboardInterrupt would throw away the real diagnostic after
+    // what may have been hours of work.
     let on_progress = |p: Progress| -> bool {
         Python::attach(|py| {
-            if py.check_signals().is_err() {
+            if let Err(err) = py.check_signals() {
+                err.restore(py);
                 return false;
             }
             let Some(cb) = progress.as_ref() else {
                 return true;
             };
             let payload = PyDict::new(py);
-            let ok = payload
+            let called = payload
                 .set_item("bytes_read", p.bytes_read)
                 .and_then(|()| payload.set_item("rows", p.rows))
                 .and_then(|()| payload.set_item("tables_done", p.tables_done))
                 .and_then(|()| payload.set_item("table", p.table))
                 .and_then(|()| cb.call1(py, (payload,)).map(|_| ()));
-            ok.is_ok()
+            match called {
+                Ok(()) => true,
+                Err(err) => {
+                    err.restore(py);
+                    false
+                }
+            }
         })
     };
 
-    let report: LoadReport = py
-        .detach(|| pipeline::run_file(&dump_path, &config, on_progress))
-        .map_err(to_pyerr)?;
+    let outcome = py.detach(|| pipeline::run_file(&dump_path, &config, on_progress));
+
+    // Whatever the callback restored wins: it is the cause, and Error::Interrupted is
+    // only the mechanism by which the load stopped.
+    if let Some(err) = PyErr::take(py) {
+        return Err(err);
+    }
+    let report: LoadReport = outcome.map_err(to_pyerr)?;
 
     let tables = report
         .tables

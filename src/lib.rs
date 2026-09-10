@@ -6,13 +6,20 @@
 //! `docs/architecture.md` for the full design, including the concurrency model and the
 //! failure model.
 //!
-//! Every stage is synchronous and allocation-free in steady state. Asynchrony appears
-//! only at the storage edge, in [`sink`], which [`pipeline`] drives on a private runtime.
+//! Every decode stage is synchronous and allocation-free in steady state. Asynchrony
+//! appears only at the storage edge, in [`sink`], which [`pipeline`] drives on a private
+//! runtime.
 //!
-//! # Status
+//! # Entry points
 //!
-//! The pipeline runs end to end, single threaded. The decode pool described in the
-//! architecture document is not built yet, and neither are the Python bindings.
+//! [`pipeline::run`] and [`pipeline::run_file`] are the Rust surface, and the compiled
+//! `pgdelta` Python module wraps the latter. Both are blocking, and both must be called
+//! from outside a Tokio runtime.
+//!
+//! The reader and scanner run on the calling thread, because DDL must be read in order.
+//! Row decoding and Parquet encoding run on a pool of workers sized by
+//! [`pipeline::LoadConfig::threads`]; see the [`pipeline`] module documentation for the
+//! concurrency model and for what bounds peak memory.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

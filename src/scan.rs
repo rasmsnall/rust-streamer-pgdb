@@ -19,6 +19,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fmt;
 
 use crate::copy::is_end_of_data;
 use crate::error::{Error, Result};
@@ -28,6 +29,53 @@ use crate::error::{Error, Result};
 /// A dump from any other major fails the load rather than being parsed speculatively,
 /// which is the tripwire for a source system being upgraded without notice.
 pub const SUPPORTED_MAJORS: &[u32] = &[16, 17];
+
+/// A table's name, with the schema kept separate from the table identifier.
+///
+/// The two are never joined into one string internally, because a dot is legal inside a
+/// quoted PostgreSQL identifier. Joined, `public."a.b"` and schema `public.a` table `b`
+/// are indistinguishable and would map to the same output path. Table names come from a
+/// third party, so that collision is a security boundary rather than a nicety; see
+/// [`crate::sink::relative_path`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TableName {
+    /// Schema, when the dump qualified the name.
+    pub schema: Option<String>,
+    /// Table identifier, with any quoting removed and `""` unescaped.
+    pub table: String,
+}
+
+impl TableName {
+    /// Renders the name the way the dump writes it, for statistics, filters and messages.
+    ///
+    /// Display only. It is ambiguous when an identifier contains a dot, which is exactly
+    /// why the parts are stored apart; never split the result to recover them.
+    ///
+    /// # Panics
+    ///
+    /// Does not panic.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pgdelta::scan::TableName;
+    ///
+    /// let name = TableName { schema: Some("public".into()), table: "users".into() };
+    /// assert_eq!(name.qualified(), "public.users");
+    /// ```
+    pub fn qualified(&self) -> String {
+        self.to_string()
+    }
+}
+
+impl fmt::Display for TableName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.schema {
+            Some(schema) => write!(f, "{schema}.{}", self.table),
+            None => f.write_str(&self.table),
+        }
+    }
+}
 
 /// One column recovered from a `CREATE TABLE` statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,8 +90,8 @@ pub struct ColumnDef {
 /// A table's shape, recovered from `CREATE TABLE`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableDef {
-    /// Qualified name as written in the dump, for example `public.users`.
-    pub name: String,
+    /// Name as written in the dump, with schema and table kept apart.
+    pub name: TableName,
     /// Columns in declaration order. Table-level constraints are not represented.
     pub columns: Vec<ColumnDef>,
 }
@@ -66,8 +114,8 @@ pub enum Event<'a> {
     Table(TableDef),
     /// A `COPY` block began.
     CopyStart {
-        /// Qualified table name.
-        table: String,
+        /// Table name, schema kept separate.
+        table: TableName,
         /// Column names from the `COPY` statement, which need not match declaration
         /// order in `CREATE TABLE`.
         columns: Vec<String>,
@@ -76,8 +124,8 @@ pub enum Event<'a> {
     CopyRows(Cow<'a, [u8]>),
     /// A `COPY` block closed with `\.`.
     CopyEnd {
-        /// Qualified table name.
-        table: String,
+        /// Table name, schema kept separate.
+        table: TableName,
     },
 }
 
@@ -96,7 +144,7 @@ pub struct Scanner {
     /// Accumulated text of a `CREATE TABLE` currently being read.
     ddl: Vec<u8>,
     in_create: bool,
-    open_table: Option<String>,
+    open_table: Option<TableName>,
     dumped_by: Option<u32>,
     from_database: Option<u32>,
     tables: HashMap<String, TableDef>,
@@ -133,7 +181,7 @@ impl Scanner {
         self.from_database
     }
 
-    /// Table definitions recovered so far, keyed by qualified name.
+    /// Table definitions recovered so far, keyed by [`TableName::qualified`].
     pub fn tables(&self) -> &HashMap<String, TableDef> {
         &self.tables
     }
@@ -226,7 +274,11 @@ impl Scanner {
     pub fn finish(&mut self) -> Result<()> {
         if self.state == State::Copy {
             return Err(Error::UnterminatedCopy {
-                table: self.open_table.clone().unwrap_or_default(),
+                table: self
+                    .open_table
+                    .as_ref()
+                    .map(TableName::qualified)
+                    .unwrap_or_default(),
             });
         }
         if self.dumped_by.is_none() {
@@ -250,7 +302,7 @@ impl Scanner {
                 self.in_create = false;
                 let ddl = std::mem::take(&mut self.ddl);
                 let def = parse_create_table(&ddl)?;
-                self.tables.insert(def.name.clone(), def.clone());
+                self.tables.insert(def.name.qualified(), def.clone());
                 events.push(Event::Table(def));
             }
             return Ok(());
@@ -280,7 +332,7 @@ impl Scanner {
             return Ok(());
         }
 
-        if strip_prefix_ci(line, b"CREATE TABLE ").is_some() {
+        if strip_create_table(line).is_some() {
             // pg_dump writes the opening paren on the first line and one column per
             // line thereafter, but a single-line form is also accepted.
             self.ddl.clear();
@@ -288,7 +340,7 @@ impl Scanner {
             if line.trim_ascii_end().ends_with(b");") {
                 let ddl = std::mem::take(&mut self.ddl);
                 let def = parse_create_table(&ddl)?;
-                self.tables.insert(def.name.clone(), def.clone());
+                self.tables.insert(def.name.qualified(), def.clone());
                 events.push(Event::Table(def));
             } else {
                 self.in_create = true;
@@ -405,18 +457,21 @@ fn split_top_level(s: &[u8], sep: u8) -> Vec<&[u8]> {
 fn take_identifier(s: &[u8]) -> Option<(String, &[u8])> {
     let s = s.trim_ascii_start();
     if s.first() == Some(&b'"') {
-        let mut name = String::new();
+        // Collect bytes and decode once. Pushing each byte `as char` would decode the
+        // name as Latin-1, and pg_dump quotes every identifier that is not lowercase
+        // ASCII, so that would mangle any name carrying a non-ASCII character.
+        let mut name: Vec<u8> = Vec::new();
         let mut i = 1;
         while i < s.len() {
             if s[i] == b'"' {
                 if s.get(i + 1) == Some(&b'"') {
-                    name.push('"');
+                    name.push(b'"');
                     i += 2;
                     continue;
                 }
-                return Some((name, &s[i + 1..]));
+                return Some((String::from_utf8_lossy(&name).into_owned(), &s[i + 1..]));
             }
-            name.push(s[i] as char);
+            name.push(s[i]);
             i += 1;
         }
         None
@@ -432,15 +487,78 @@ fn take_identifier(s: &[u8]) -> Option<(String, &[u8])> {
     }
 }
 
-/// Reads a possibly schema-qualified identifier such as `public."odd name"`.
-fn take_qualified(s: &[u8]) -> Option<(String, &[u8])> {
+/// Reads a possibly schema-qualified identifier such as `public."odd.name"`.
+///
+/// The parts are kept apart rather than joined, so that a dot inside a quoted identifier
+/// stays distinguishable from the schema separator. See [`TableName`].
+fn take_qualified(s: &[u8]) -> Option<(TableName, &[u8])> {
     let (first, rest) = take_identifier(s)?;
     if rest.first() == Some(&b'.') {
         let (second, rest) = take_identifier(&rest[1..])?;
-        Some((format!("{first}.{second}"), rest))
+        Some((
+            TableName {
+                schema: Some(first),
+                table: second,
+            },
+            rest,
+        ))
     } else {
-        Some((first, rest))
+        Some((
+            TableName {
+                schema: None,
+                table: first,
+            },
+            rest,
+        ))
     }
+}
+
+/// Strips the `CREATE ... TABLE ` keyword, returning what follows.
+///
+/// pg_dump writes `CREATE UNLOGGED TABLE` for an unlogged table and dumps its rows
+/// normally, so recognising only the plain form would leave the table undefined and fail
+/// the load when its `COPY` block arrived.
+fn strip_create_table(line: &[u8]) -> Option<&[u8]> {
+    strip_prefix_ci(line, b"CREATE TABLE ")
+        .or_else(|| strip_prefix_ci(line, b"CREATE UNLOGGED TABLE "))
+}
+
+/// Returns the index of the `)` matching the `(` at `open`, ignoring parens inside
+/// double-quoted identifiers.
+///
+/// Taking the last `)` in the statement instead would swallow whatever pg_dump writes
+/// after the column list: `PARTITION BY RANGE (...)`, `INHERITS (...)` and
+/// `WITH (fillfactor=...)` all appear there.
+fn matching_paren(s: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut quoted = false;
+    let mut i = open;
+    while i < s.len() {
+        let c = s[i];
+        if quoted {
+            if c == b'"' {
+                if s.get(i + 1) == Some(&b'"') {
+                    i += 2;
+                    continue;
+                }
+                quoted = false;
+            }
+        } else {
+            match c {
+                b'"' => quoted = true,
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Keywords that end a column's type text. Matched at paren depth zero only, so that
@@ -511,8 +629,8 @@ fn take_type(s: &[u8]) -> String {
 /// [`Error::MalformedCreateTable`] if the statement has no parenthesised body or its
 /// name cannot be read.
 pub fn parse_create_table(ddl: &[u8]) -> Result<TableDef> {
-    let after_kw = strip_prefix_ci(ddl.trim_ascii_start(), b"CREATE TABLE ")
-        .ok_or_else(|| Error::MalformedCreateTable {
+    let after_kw =
+        strip_create_table(ddl.trim_ascii_start()).ok_or_else(|| Error::MalformedCreateTable {
             table: String::new(),
         })?;
     let (name, rest) = take_qualified(after_kw).ok_or_else(|| Error::MalformedCreateTable {
@@ -522,14 +640,12 @@ pub fn parse_create_table(ddl: &[u8]) -> Result<TableDef> {
     let open = rest
         .iter()
         .position(|c| *c == b'(')
-        .ok_or_else(|| Error::MalformedCreateTable { table: name.clone() })?;
-    let close = rest
-        .iter()
-        .rposition(|c| *c == b')')
-        .ok_or_else(|| Error::MalformedCreateTable { table: name.clone() })?;
-    if close <= open {
-        return Err(Error::MalformedCreateTable { table: name });
-    }
+        .ok_or_else(|| Error::MalformedCreateTable {
+            table: name.qualified(),
+        })?;
+    let close = matching_paren(rest, open).ok_or_else(|| Error::MalformedCreateTable {
+        table: name.qualified(),
+    })?;
 
     let mut columns = Vec::new();
     for item in split_top_level(&rest[open + 1..close], b',') {
@@ -572,7 +688,7 @@ pub fn parse_create_table(ddl: &[u8]) -> Result<TableDef> {
 ///
 /// [`Error::MalformedCopyHeader`] if the table name cannot be read. The reported offset
 /// is zero, because this function sees one statement rather than the whole dump.
-pub fn parse_copy_header(line: &[u8]) -> Result<(String, Vec<String>)> {
+pub fn parse_copy_header(line: &[u8]) -> Result<(TableName, Vec<String>)> {
     let after_kw =
         strip_prefix_ci(line.trim_ascii_start(), b"COPY ").ok_or(Error::MalformedCopyHeader {
             offset: 0,
@@ -581,7 +697,7 @@ pub fn parse_copy_header(line: &[u8]) -> Result<(String, Vec<String>)> {
 
     let mut columns = Vec::new();
     let open = rest.iter().position(|c| *c == b'(');
-    let close = rest.iter().rposition(|c| *c == b')');
+    let close = open.and_then(|o| matching_paren(rest, o));
     if let (Some(open), Some(close)) = (open, close)
         && close > open
     {
@@ -602,6 +718,14 @@ mod tests {
 
     fn events_of<'a>(s: &mut Scanner, chunk: &'a [u8]) -> Vec<Event<'a>> {
         s.feed(chunk).unwrap()
+    }
+
+    /// A schema-qualified name, for comparing against what the scanner produced.
+    fn qualified(schema: &str, table: &str) -> TableName {
+        TableName {
+            schema: Some(schema.to_string()),
+            table: table.to_string(),
+        }
     }
 
     #[test]
@@ -631,7 +755,7 @@ mod tests {
     fn parses_multiline_create_table() {
         let ddl = b"CREATE TABLE public.users (\n    id integer NOT NULL,\n    email character varying(255),\n    price numeric(10,2) DEFAULT 0,\n    made timestamp(3) without time zone,\n    total integer GENERATED ALWAYS AS (id * 2) STORED,\n    CONSTRAINT users_pkey PRIMARY KEY (id)\n);";
         let def = parse_create_table(ddl).unwrap();
-        assert_eq!(def.name, "public.users");
+        assert_eq!(def.name, qualified("public", "users"));
         let got: Vec<_> = def
             .columns
             .iter()
@@ -653,19 +777,107 @@ mod tests {
     fn quoted_identifiers_survive() {
         let ddl = br#"CREATE TABLE public."odd ""name" ("a,b" integer, "sel ect" text);"#;
         let def = parse_create_table(ddl).unwrap();
-        assert_eq!(def.name, r#"public.odd "name"#);
+        assert_eq!(def.name, qualified("public", r#"odd "name"#));
         assert_eq!(def.columns[0].name, "a,b");
         assert_eq!(def.columns[1].name, "sel ect");
+    }
+
+    /// pg_dump quotes every identifier that is not plain lowercase ASCII, so a quoted
+    /// name carrying UTF-8 is the normal case for any non-English schema. Decoding it
+    /// byte-by-byte as Latin-1 would mangle it into mojibake, and for a table name that
+    /// mojibake then fails the path guard and kills the whole load.
+    #[test]
+    fn quoted_identifiers_are_utf8_not_latin1() {
+        let ddl = "CREATE TABLE public.\"Räksmörgås\" (\"belopp_öre\" bigint);".as_bytes();
+        let def = parse_create_table(ddl).unwrap();
+        assert_eq!(def.name, qualified("public", "Räksmörgås"));
+        assert_eq!(def.columns[0].name, "belopp_öre");
+
+        let (table, columns) =
+            parse_copy_header("COPY public.\"Räksmörgås\" (\"belopp_öre\") FROM stdin;".as_bytes())
+                .unwrap();
+        assert_eq!(table, qualified("public", "Räksmörgås"));
+        assert_eq!(columns, vec!["belopp_öre"]);
+    }
+
+    /// A dot is legal inside a quoted identifier, and must stay attached to the part it
+    /// came from rather than being taken for the schema separator.
+    #[test]
+    fn a_dot_inside_a_quoted_identifier_stays_in_that_part() {
+        let (table, _) = parse_copy_header(br#"COPY public."a.b" (x) FROM stdin;"#).unwrap();
+        assert_eq!(table, qualified("public", "a.b"));
+        assert_eq!(table.schema.as_deref(), Some("public"));
+        assert_eq!(table.table, "a.b");
+    }
+
+    /// The column list ends at the paren matching the one that opened it. Taking the last
+    /// paren in the statement instead swallows whatever pg_dump writes afterwards.
+    #[test]
+    fn trailing_clauses_do_not_swallow_the_column_list() {
+        let cases: &[&[u8]] = &[
+            b"CREATE TABLE public.t (
+    a integer,
+    b integer
+)
+WITH (fillfactor='70');",
+            b"CREATE TABLE public.t (
+    a integer,
+    b integer
+)
+PARTITION BY RANGE (b);",
+            b"CREATE TABLE public.t (
+    a integer,
+    b integer
+)
+INHERITS (public.parent);",
+        ];
+        for ddl in cases {
+            let def = parse_create_table(ddl).unwrap();
+            let got: Vec<_> = def
+                .columns
+                .iter()
+                .map(|c| (c.name.as_str(), c.sql_type.as_str()))
+                .collect();
+            assert_eq!(
+                got,
+                vec![("a", "integer"), ("b", "integer")],
+                "trailing clause leaked into the columns of {}",
+                String::from_utf8_lossy(ddl)
+            );
+        }
+    }
+
+    /// pg_dump writes `CREATE UNLOGGED TABLE` for an unlogged table and dumps its rows
+    /// normally, so missing the keyword leaves the table undefined when its COPY arrives.
+    #[test]
+    fn unlogged_tables_are_recognised() {
+        let def =
+            parse_create_table(b"CREATE UNLOGGED TABLE public.staging (id integer);").unwrap();
+        assert_eq!(def.name, qualified("public", "staging"));
+        assert_eq!(def.columns[0].name, "id");
+
+        let mut s = Scanner::new();
+        let mut dump = PREAMBLE.to_vec();
+        dump.extend_from_slice(b"CREATE UNLOGGED TABLE public.staging (id integer);\n");
+        dump.extend_from_slice(b"COPY public.staging (id) FROM stdin;\n1\n");
+        dump.extend_from_slice(br"\.");
+        dump.push(b'\n');
+        let ev = s.feed(&dump).unwrap();
+        s.finish().unwrap();
+        assert!(
+            ev.iter().any(|e| matches!(e, Event::Table(d) if d.name.table == "staging")),
+            "no table definition was emitted for an unlogged table"
+        );
     }
 
     #[test]
     fn parses_copy_header() {
         let (t, c) = parse_copy_header(b"COPY public.users (id, email) FROM stdin;").unwrap();
-        assert_eq!(t, "public.users");
+        assert_eq!(t, qualified("public", "users"));
         assert_eq!(c, vec!["id", "email"]);
 
         let (t, c) = parse_copy_header(b"COPY public.users FROM stdin;").unwrap();
-        assert_eq!(t, "public.users");
+        assert_eq!(t, qualified("public", "users"));
         assert!(c.is_empty());
     }
 
@@ -685,7 +897,7 @@ mod tests {
         assert_eq!(
             ev[4],
             Event::CopyEnd {
-                table: "public.t".into()
+                table: qualified("public", "t")
             }
         );
     }

@@ -49,6 +49,7 @@
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use deltalake::DeltaTable;
 use deltalake::kernel::Action;
@@ -59,7 +60,7 @@ use crate::chan::{self, bounded};
 use crate::copy::{self, Limits};
 use crate::dump::{ChunkReader, decompressed};
 use crate::error::{Error, Result};
-use crate::scan::{Event, Scanner, TableDef};
+use crate::scan::{Event, Scanner, TableDef, TableName};
 use crate::sink::{TableWriter, WriteMode, commit_table, open_table};
 use crate::types::{self, ResolvedType};
 
@@ -96,7 +97,8 @@ pub struct LoadConfig {
     /// When set, the load fails unless the dump's `pg_dump` major matches exactly. This
     /// is the tripwire for the source system being upgraded without notice.
     pub expect_pg_major: Option<u32>,
-    /// Bounds enforced on every field, row, and column while decoding.
+    /// Bounds enforced on every field, row, and column while decoding. `max_row_bytes`
+    /// also caps how far the reader will grow a chunk around one very long line.
     pub limits: Limits,
 }
 
@@ -123,7 +125,8 @@ impl Default for LoadConfig {
 /// load, which fails it with [`Error::Interrupted`] before anything is committed.
 #[derive(Debug, Clone)]
 pub struct Progress {
-    /// Compressed bytes read from the input so far.
+    /// Bytes taken from the input so far, counted before decompression so the figure is
+    /// comparable with the size of the dump on disk.
     pub bytes_read: u64,
     /// Rows decoded across all tables so far.
     pub rows: u64,
@@ -161,7 +164,7 @@ pub struct LoadReport {
     pub from_database: Option<u32>,
     /// Compression that was decoded off the input, or `"none"`.
     pub compression: &'static str,
-    /// Compressed bytes read from the input.
+    /// Bytes taken from the input, counted before decompression.
     pub bytes_read: u64,
     /// Rows decoded across every loaded table.
     pub total_rows: u64,
@@ -187,7 +190,7 @@ fn resolve_copy_columns(def: &TableDef, columns: &[String]) -> Result<Vec<Resolv
                 .find(|c| &c.name == name)
                 .map(|c| types::resolve(&c.sql_type))
                 .ok_or_else(|| Error::MalformedCreateTable {
-                    table: def.name.clone(),
+                    table: def.name.qualified(),
                 })
         })
         .collect()
@@ -196,7 +199,8 @@ fn resolve_copy_columns(def: &TableDef, columns: &[String]) -> Result<Vec<Resolv
 /// Reader-side bookkeeping for the `COPY` block currently open.
 struct OpenBlock {
     generation: u64,
-    table: String,
+    table: TableName,
+    qualified: String,
     columns: Vec<(String, ResolvedType)>,
 }
 
@@ -278,10 +282,14 @@ struct WorkerBlock {
 /// - [`Error::Delta`], [`Error::Arrow`], [`Error::Io`] for a storage, encoding, read, or
 ///   internal pool failure.
 /// - [`Error::Interrupted`] if `progress` returned `false`.
+/// - [`Error::Internal`] if the scanner and this module disagree about block structure,
+///   which would be a defect here rather than a bad dump.
 ///
 /// # Panics
 ///
-/// Does not panic. A decode worker that panics is reported as [`Error::Io`].
+/// Does not panic. A decode worker that panics is reported as [`Error::Io`], and a broken
+/// invariant is reported as [`Error::Internal`] rather than unwinding, because this runs
+/// underneath the Python bindings.
 ///
 /// # Blocking
 ///
@@ -388,6 +396,24 @@ where
     run(std::io::BufReader::new(file), config, progress)
 }
 
+/// Wraps the raw input to count bytes before they reach the decompressor.
+///
+/// The reported figure is therefore comparable with the size of the dump on disk, which
+/// is what a caller driving a progress bar needs. Counting the decompressed stream would
+/// run several times past the file's length on a gzipped dump.
+struct CountingReader<R> {
+    inner: R,
+    count: Arc<AtomicU64>,
+}
+
+impl<R: std::io::Read> std::io::Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let got = self.inner.read(buf)?;
+        self.count.fetch_add(got as u64, Ordering::Relaxed);
+        Ok(got)
+    }
+}
+
 /// Signals that the decode pool is gone when the reader expected it to be working.
 fn pool_stopped() -> Error {
     Error::Io {
@@ -423,14 +449,29 @@ where
     R: std::io::Read + 'static,
     F: FnMut(Progress) -> bool,
 {
-    let (compression, reader) = decompressed(input)?;
-    let mut chunks = ChunkReader::new(reader);
+    // Count on the way in, before decompression, so the figure reported to the caller can
+    // be compared against the size of the file on disk.
+    let consumed = Arc::new(AtomicU64::new(0));
+    let counted = CountingReader {
+        inner: input,
+        count: Arc::clone(&consumed),
+    };
+    let (compression, reader) = decompressed(counted)?;
+
+    // A chunk is only allowed to outgrow the target when a single line does, so the row
+    // ceiling is what should bound it. Without this the reader would buffer up to the
+    // 256 MiB default however tightly the caller set `max_row_bytes`.
+    let max_chunk = config
+        .limits
+        .max_row_bytes
+        .max(crate::dump::DEFAULT_CHUNK_BYTES);
+    let mut chunks =
+        ChunkReader::with_limits(reader, crate::dump::DEFAULT_CHUNK_BYTES, max_chunk);
     let mut scanner = Scanner::new();
 
     let mut table_defs: HashMap<String, TableDef> = HashMap::new();
     let mut dumped_by: Option<u32> = None;
     let mut from_database: Option<u32> = None;
-    let mut bytes_read: u64 = 0;
     let mut total_rows: u64 = 0;
     let mut tables: Vec<TableStats> = Vec::new();
 
@@ -451,7 +492,7 @@ where
     };
 
     while let Some(chunk) = chunks.next_chunk()? {
-        bytes_read += chunk.len() as u64;
+        let bytes_read = consumed.load(Ordering::Relaxed);
 
         for event in scanner.feed(chunk)? {
             match event {
@@ -469,18 +510,23 @@ where
                 }
 
                 Event::Table(def) => {
-                    table_defs.insert(def.name.clone(), def);
+                    table_defs.insert(def.name.qualified(), def);
                 }
 
                 Event::CopyStart { table, columns } => {
-                    debug_assert!(current.is_none(), "CopyStart while a block is open");
-                    if !wanted(&table) {
+                    if current.is_some() {
+                        return Err(Error::Internal {
+                            detail: "COPY block started while another was still open",
+                        });
+                    }
+                    let qualified = table.qualified();
+                    if !wanted(&qualified) {
                         skipping = true;
                         continue;
                     }
-                    let def = table_defs.get(&table).ok_or_else(|| {
+                    let def = table_defs.get(&qualified).ok_or_else(|| {
                         Error::MalformedCreateTable {
-                            table: table.clone(),
+                            table: qualified.clone(),
                         }
                     })?;
                     let resolved = resolve_copy_columns(def, &columns)?;
@@ -494,7 +540,7 @@ where
                         config.mode,
                         &config.storage_options,
                     ))?;
-                    open_tables.push((table.clone(), delta_table.clone()));
+                    open_tables.push((qualified.clone(), delta_table.clone()));
 
                     generation += 1;
                     let ctx = Arc::new(BlockCtx {
@@ -512,6 +558,7 @@ where
                     current = Some(OpenBlock {
                         generation,
                         table,
+                        qualified,
                         columns: pairs,
                     });
                     round_robin = 0;
@@ -522,7 +569,11 @@ where
                         continue;
                     }
                     let Some(block) = current.as_ref() else {
-                        continue;
+                        // Dropping rows here would commit a short table, which is the
+                        // worst outcome this library has. Fail instead.
+                        return Err(Error::Internal {
+                            detail: "COPY rows arrived with no open block",
+                        });
                     };
                     let worker = round_robin % job_tx.len();
                     round_robin += 1;
@@ -541,12 +592,22 @@ where
                         skipping = false;
                         continue;
                     }
-                    let OpenBlock {
+                    let Some(OpenBlock {
                         generation: block_gen,
                         table: name,
+                        qualified,
                         columns,
-                    } = current.take().expect("CopyEnd without a CopyStart");
-                    debug_assert_eq!(name, table);
+                    }) = current.take()
+                    else {
+                        return Err(Error::Internal {
+                            detail: "COPY block ended with none open",
+                        });
+                    };
+                    if name != table {
+                        return Err(Error::Internal {
+                            detail: "COPY block ended under a different name than it began",
+                        });
+                    }
 
                     for tx in job_tx {
                         dispatch(
@@ -581,7 +642,10 @@ where
                     }
 
                     total_rows += rows;
-                    staged.entry(name.clone()).or_default().extend(block_actions);
+                    staged
+                        .entry(qualified.clone())
+                        .or_default()
+                        .extend(block_actions);
 
                     let null_substitutions = columns
                         .iter()
@@ -595,7 +659,7 @@ where
                         .map(|(n, rt)| (n.clone(), rt.source.clone()))
                         .collect();
                     tables.push(TableStats {
-                        table: name,
+                        table: qualified,
                         rows,
                         batches,
                         delta_version: 0,
@@ -607,7 +671,7 @@ where
                         bytes_read,
                         rows: total_rows,
                         tables_done: tables.len(),
-                        table: Some(table),
+                        table: Some(table.qualified()),
                     }) {
                         return Err(Error::Interrupted);
                     }
@@ -642,7 +706,7 @@ where
         dumped_by,
         from_database,
         compression: compression.name(),
-        bytes_read,
+        bytes_read: consumed.load(Ordering::Relaxed),
         total_rows,
         tables,
     })
@@ -845,6 +909,38 @@ COPY public.events (id, kind) FROM stdin;
         assert_eq!(wide.rows, 300_000);
         assert!(wide.batches >= 4, "expected many batches, got {}", wide.batches);
         assert!(wide.delta_version >= 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A caller sizes a progress bar against the file on disk, so the count has to be of
+    /// what was taken from the input, not of what came out of the decompressor.
+    #[test]
+    fn bytes_read_counts_the_input_not_the_inflated_stream() {
+        let dir = tmpdir("gzbytes");
+        let plain = dump(TWO_TABLES);
+
+        let mut encoder =
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, &plain).unwrap();
+        let gz = encoder.finish().unwrap();
+        assert!(gz.len() < plain.len(), "fixture must actually compress");
+
+        let config = LoadConfig {
+            output_uri: prefix(&dir),
+            threads: 2,
+            ..LoadConfig::default()
+        };
+        let report = run(Cursor::new(gz.clone()), &config, |_| true).unwrap();
+
+        assert_eq!(report.compression, "gzip");
+        assert_eq!(report.total_rows, 5);
+        assert_eq!(
+            report.bytes_read,
+            gz.len() as u64,
+            "bytes_read must match the compressed input, not the {} inflated bytes",
+            plain.len()
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

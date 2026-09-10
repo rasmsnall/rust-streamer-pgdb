@@ -86,22 +86,33 @@ pub struct ResolvedType {
 impl ResolvedType {
     /// True if this column will be written as text, whatever its declaration said.
     ///
-    /// Arrays, unconstrained `numeric`, wide `numeric`, and everything unrecognised all
-    /// answer true.
+    /// Arrays, unconstrained `numeric`, `numeric` whose precision or scale Arrow cannot
+    /// represent, and everything unrecognised all answer true.
     pub fn is_textual(&self) -> bool {
         if self.is_array || self.pg == PgType::Text {
             return true;
         }
-        matches!(self.pg, PgType::Numeric { precision, .. } if !decimal_fits(precision))
+        matches!(self.pg, PgType::Numeric { precision, scale } if !decimal_fits(precision, scale))
     }
 }
 
 /// Arrow's `Decimal128` carries at most 38 significant digits.
 const MAX_DECIMAL_PRECISION: u8 = 38;
 
-/// True if a `numeric` of this precision fits a fixed-width decimal.
-fn decimal_fits(precision: Option<u8>) -> bool {
-    matches!(precision, Some(p) if (1..=MAX_DECIMAL_PRECISION).contains(&p))
+/// True if a `numeric` of this precision and scale fits a fixed-width decimal.
+///
+/// Arrow requires `1 <= precision <= 38` and `0 <= scale <= precision`. PostgreSQL 15 and
+/// later accept declarations outside that, notably a negative scale (`numeric(5,-2)`) and
+/// a scale exceeding the precision (`numeric(2,5)`), so both are checked here rather than
+/// discovered later by an Arrow builder. A declaration that does not fit degrades to text,
+/// which is the documented policy and keeps the literal value intact.
+fn decimal_fits(precision: Option<u8>, scale: Option<i8>) -> bool {
+    let Some(p) = precision else { return false };
+    if !(1..=MAX_DECIMAL_PRECISION).contains(&p) {
+        return false;
+    }
+    // An omitted scale means zero, which always fits.
+    scale.is_none_or(|s| s >= 0 && i16::from(s) <= i16::from(p))
 }
 
 /// Type names that are textual and recognised as such.
@@ -350,6 +361,23 @@ mod tests {
         assert!(resolve("numeric(39,2)").is_textual());
         assert!(!resolve("numeric(38,2)").is_textual());
         assert!(!resolve("numeric(1,0)").is_textual());
+    }
+
+    /// PostgreSQL 15 and later accept a scale outside `0..=precision`, which Arrow's
+    /// `Decimal128` cannot express. Such a column must be routed to text here, or the
+    /// builder and the schema disagree and the whole load dies on the first flush.
+    #[test]
+    fn numeric_scales_arrow_cannot_hold_become_text() {
+        assert!(
+            resolve("numeric(2,5)").is_textual(),
+            "scale exceeding precision is legal in PG15+ and must degrade"
+        );
+        assert!(
+            resolve("numeric(5,-2)").is_textual(),
+            "negative scale is legal in PG15+ and must degrade"
+        );
+        assert!(!resolve("numeric(5,5)").is_textual(), "scale == precision fits");
+        assert!(!resolve("numeric(5,0)").is_textual());
     }
 
     #[test]

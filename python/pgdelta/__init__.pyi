@@ -66,7 +66,7 @@ class LoadReport:
 
     @property
     def bytes_read(self) -> int:
-        """Compressed bytes read from the input."""
+        """Bytes taken from the input, counted before decompression."""
 
     @property
     def total_rows(self) -> int:
@@ -128,7 +128,8 @@ def stream_dump_to_delta(
         Override the decode limits that protect the driver from a hostile dump.
     progress:
         Called with a :class:`ProgressEvent` after each chunk and each table. Raising from
-        it, or a Ctrl-C, aborts the load before any commit.
+        it, or a Ctrl-C, aborts the load before any commit; the exception you raised is
+        the one that propagates, not a generic ``KeyboardInterrupt``.
 
     Returns
     -------

@@ -112,11 +112,16 @@ pub enum ColumnBuilder {
 impl ColumnBuilder {
     /// Creates a builder matching `rt`.
     ///
+    /// The builder must agree with [`arrow_type`], because the schema is built from the
+    /// latter and [`BatchBuilder::finish`] would otherwise fail. That agreement rests on
+    /// [`ResolvedType::is_textual`], which routes any `numeric` Arrow cannot represent to
+    /// text before either function sees it.
+    ///
     /// # Panics
     ///
-    /// Does not panic. A decimal whose precision and scale Arrow rejects cannot occur,
-    /// because [`ResolvedType::is_textual`] routes those columns to text first; should
-    /// that invariant ever break, the column degrades to text rather than aborting.
+    /// Does not panic. The decimal fallback below is unreachable defence: if it ever did
+    /// fire, the mismatch with [`arrow_type`] would surface as [`Error::Arrow`] on the
+    /// next flush rather than as a panic here.
     pub fn new(rt: &ResolvedType) -> Self {
         if rt.is_textual() {
             return ColumnBuilder::Utf8(StringBuilder::new());

@@ -41,6 +41,7 @@ use deltalake::{DeltaTable, DeltaTableBuilder};
 use futures::TryStreamExt;
 
 use crate::error::{Error, Result};
+use crate::scan::TableName;
 
 /// How an existing table is treated when a load begins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,62 +72,86 @@ fn delta(e: impl std::fmt::Display) -> Error {
     }
 }
 
-/// Maps a qualified table name to a path relative to the output prefix.
+/// Maps a table name to a path relative to the output prefix.
 ///
 /// Table names originate with a third party and `../` is a legal quoted PostgreSQL
 /// identifier, so this is a security boundary rather than a formatting convenience.
 /// Names are **validated and rejected**, never sanitised: silently rewriting a name
 /// would map two different source tables onto one output path.
 ///
+/// The schema and the table are validated as separate components and are never recovered
+/// by splitting a joined string, because a dot is legal inside a quoted identifier:
+/// `public."a.b"` and schema `public.a` table `b` would otherwise yield the same path.
+/// See [`TableName`].
+///
 /// A component may contain letters, digits, underscores, hyphens and spaces. Anything
-/// else, including path separators, `.` and `..`, control characters, and a leading or
-/// trailing space, is refused.
+/// else, including path separators, dots, control characters, and a leading or trailing
+/// space, is refused. Letters are judged by Unicode, so `"Räksmörgås"` is accepted.
 ///
 /// # Errors
 ///
 /// [`Error::UnsafeTableName`] for any name that fails validation.
 ///
+/// # Panics
+///
+/// Does not panic.
+///
 /// # Examples
 ///
 /// ```
+/// use pgdelta::scan::TableName;
 /// use pgdelta::sink::relative_path;
 ///
-/// assert_eq!(relative_path("public.users").unwrap(), "public/users");
-/// assert!(relative_path("public.../etc/passwd").is_err());
-/// assert!(relative_path("..").is_err());
+/// fn name(schema: Option<&str>, table: &str) -> TableName {
+///     TableName { schema: schema.map(str::to_string), table: table.to_string() }
+/// }
+///
+/// assert_eq!(relative_path(&name(Some("public"), "users")).unwrap(), "public/users");
+/// assert_eq!(relative_path(&name(None, "users")).unwrap(), "users");
+///
+/// // A dot inside an identifier is refused, not split into extra path components.
+/// assert!(relative_path(&name(Some("public"), "a.b")).is_err());
+/// assert!(relative_path(&name(None, "..")).is_err());
+/// assert!(relative_path(&name(Some("public"), "../../etc/passwd")).is_err());
 /// ```
-pub fn relative_path(table: &str) -> Result<String> {
+pub fn relative_path(name: &TableName) -> Result<String> {
     let reject = || Error::UnsafeTableName {
-        name: table.to_string(),
+        name: name.qualified(),
     };
-    if table.is_empty() || table.len() > 512 {
-        return Err(reject());
-    }
 
-    let mut parts = Vec::new();
-    for component in table.split('.') {
-        if component.is_empty() || component == "." || component == ".." {
+    let mut parts: Vec<&str> = Vec::with_capacity(2);
+    if let Some(schema) = &name.schema {
+        parts.push(schema);
+    }
+    parts.push(&name.table);
+
+    let mut total = 0usize;
+    for component in &parts {
+        if component.is_empty() || component.len() > 255 {
             return Err(reject());
         }
         if component.starts_with(' ') || component.ends_with(' ') {
             return Err(reject());
         }
-        let safe = component.chars().all(|c| {
-            c.is_alphanumeric() || c == '_' || c == '-' || c == ' '
-        }) && !component.chars().any(|c| c.is_control());
+        // Excluding the dot here is what makes `.` and `..` unreachable as whole
+        // components without a special case for them.
+        let safe = component
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == ' ')
+            && !component.chars().any(char::is_control);
         if !safe {
             return Err(reject());
         }
-        parts.push(component);
+        total += component.len();
     }
-    if parts.is_empty() || parts.len() > 3 {
+    if total > 512 {
         return Err(reject());
     }
     Ok(parts.join("/"))
 }
 
 /// Joins the output prefix and a table's relative path.
-fn table_uri(prefix: &str, table: &str) -> Result<String> {
+fn table_uri(prefix: &str, table: &TableName) -> Result<String> {
     let rel = relative_path(table)?;
     let trimmed = prefix.trim_end_matches('/');
     Ok(format!("{trimmed}/{rel}"))
@@ -166,7 +191,7 @@ async fn current_files(table: &DeltaTable) -> Result<Vec<Action>> {
 /// Does not panic.
 pub async fn open_table(
     prefix: &str,
-    table_name: &str,
+    table_name: &TableName,
     schema: &ArrowSchema,
     mode: WriteMode,
     storage_options: &HashMap<String, String>,
@@ -191,7 +216,7 @@ pub async fn open_table(
             .map_err(delta)?;
     } else if mode == WriteMode::ErrorIfExists && !current_files(&table).await?.is_empty() {
         return Err(Error::TableExists {
-            table: table_name.to_string(),
+            table: table_name.qualified(),
         });
     }
 
@@ -326,7 +351,7 @@ impl TableSink {
     /// a storage or protocol failure.
     pub async fn open(
         prefix: &str,
-        table_name: &str,
+        table_name: &TableName,
         schema: &ArrowSchema,
         mode: WriteMode,
         storage_options: &HashMap<String, String>,
@@ -334,7 +359,7 @@ impl TableSink {
         let table = open_table(prefix, table_name, schema, mode, storage_options).await?;
         let writer = TableWriter::new(&table)?;
         Ok(Self {
-            name: table_name.to_string(),
+            name: table_name.qualified(),
             table,
             writer,
             mode,
@@ -432,43 +457,82 @@ mod tests {
         format!("file://{}", dir.to_string_lossy().replace('\\', "/"))
     }
 
+    /// A schema-qualified name, as the scanner would produce it.
+    fn qualified(schema: &str, table: &str) -> TableName {
+        TableName {
+            schema: Some(schema.to_string()),
+            table: table.to_string(),
+        }
+    }
+
+    /// A bare name, as the scanner would produce it for an unqualified `COPY`.
+    fn bare(table: &str) -> TableName {
+        TableName {
+            schema: None,
+            table: table.to_string(),
+        }
+    }
+
     #[test]
     fn safe_table_names_map_to_nested_paths() {
-        assert_eq!(relative_path("public.users").unwrap(), "public/users");
-        assert_eq!(relative_path("users").unwrap(), "users");
-        assert_eq!(relative_path("my_schema.order-items").unwrap(), "my_schema/order-items");
-        assert_eq!(relative_path("s.Räksmörgås").unwrap(), "s/Räksmörgås");
+        assert_eq!(
+            relative_path(&qualified("public", "users")).unwrap(),
+            "public/users"
+        );
+        assert_eq!(relative_path(&bare("users")).unwrap(), "users");
+        assert_eq!(
+            relative_path(&qualified("my_schema", "order-items")).unwrap(),
+            "my_schema/order-items"
+        );
+        assert_eq!(
+            relative_path(&qualified("s", "Räksmörgås")).unwrap(),
+            "s/Räksmörgås",
+            "a non-ASCII identifier is legal and must survive"
+        );
     }
 
     #[test]
     fn traversal_attempts_are_rejected_not_sanitised() {
         for name in [
-            "..",
-            ".",
-            "public..users",
-            "../../etc/passwd",
-            "public./etc/passwd",
-            "public.users/../../x",
-            "public.us\\ers",
-            "",
-            "public.",
-            ".users",
-            "a.b.c.d",
-            "public.us:ers",
+            bare(".."),
+            bare("."),
+            bare("../../etc/passwd"),
+            qualified("public", "/etc/passwd"),
+            qualified("public", "users/../../x"),
+            qualified("public", "us\\ers"),
+            bare(""),
+            qualified("public", ""),
+            qualified("", "users"),
+            qualified("public", "us:ers"),
         ] {
             assert!(
-                relative_path(name).is_err(),
-                "{name:?} must be rejected"
+                relative_path(&name).is_err(),
+                "{name} must be rejected"
             );
         }
     }
 
+    /// A dot inside a quoted identifier must not become a path separator, because that
+    /// would collide with a genuinely nested name. Rejected, never rewritten.
+    #[test]
+    fn a_dot_inside_an_identifier_is_rejected_rather_than_split() {
+        assert!(relative_path(&qualified("public", "a.b")).is_err());
+        assert!(relative_path(&qualified("public.a", "b")).is_err());
+        assert!(relative_path(&bare("a.b.c.d")).is_err());
+
+        // The pair that would otherwise share a path.
+        let quoted_dot = qualified("public", "a.b");
+        let nested = qualified("public.a", "b");
+        assert_eq!(quoted_dot.qualified(), nested.qualified());
+        assert!(relative_path(&quoted_dot).is_err() && relative_path(&nested).is_err());
+    }
+
     #[test]
     fn control_characters_and_edge_spaces_are_rejected() {
-        assert!(relative_path("public.us\0ers").is_err());
-        assert!(relative_path("public.us\ners").is_err());
-        assert!(relative_path("public. users").is_err());
-        assert!(relative_path("public.users ").is_err());
+        assert!(relative_path(&qualified("public", "us\0ers")).is_err());
+        assert!(relative_path(&qualified("public", "us\ners")).is_err());
+        assert!(relative_path(&qualified("public", " users")).is_err());
+        assert!(relative_path(&qualified("public", "users ")).is_err());
     }
 
     #[test]
@@ -480,7 +544,7 @@ mod tests {
         rt().block_on(async {
             let mut sink = TableSink::open(
                 &prefix(&dir),
-                "public.users",
+                &qualified("public", "users"),
                 &schema(),
                 WriteMode::Append,
                 &HashMap::new(),
@@ -519,7 +583,7 @@ mod tests {
         rt().block_on(async {
             let mut sink = TableSink::open(
                 &prefix(&dir),
-                "public.t",
+                &qualified("public", "t"),
                 &schema(),
                 WriteMode::Append,
                 &HashMap::new(),
@@ -546,7 +610,7 @@ mod tests {
 
         rt().block_on(async {
             let p = prefix(&dir);
-            let mut first = TableSink::open(&p, "t", &schema(), WriteMode::Append, &HashMap::new())
+            let mut first = TableSink::open(&p, &bare("t"), &schema(), WriteMode::Append, &HashMap::new())
                 .await
                 .unwrap();
             first.write(batch(&[1, 2], &["a", "b"])).await.unwrap();
@@ -554,7 +618,7 @@ mod tests {
             first.commit().await.unwrap();
 
             let mut second =
-                TableSink::open(&p, "t", &schema(), WriteMode::Overwrite, &HashMap::new())
+                TableSink::open(&p, &bare("t"), &schema(), WriteMode::Overwrite, &HashMap::new())
                     .await
                     .unwrap();
             second.write(batch(&[9], &["z"])).await.unwrap();

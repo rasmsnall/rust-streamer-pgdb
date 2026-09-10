@@ -173,6 +173,16 @@ pub enum Error {
     /// Reported as an error so the load fails without committing: a partial day is never
     /// made visible. Nothing has been staged that a later run cannot overwrite.
     Interrupted,
+
+    /// An invariant between two stages of this crate was violated.
+    ///
+    /// Indicates a defect here rather than a problem with the dump. It is an error and
+    /// not a panic because a panic would unwind through the Python bindings, and because
+    /// silently continuing past it could commit a short table.
+    Internal {
+        /// Which invariant failed. Never carries dump content.
+        detail: &'static str,
+    },
 }
 
 impl fmt::Display for Error {
@@ -226,6 +236,7 @@ impl fmt::Display for Error {
             }
             Error::Io { message } => write!(f, "io error: {message}"),
             Error::Interrupted => f.write_str("load interrupted by caller"),
+            Error::Internal { detail } => write!(f, "internal invariant violated: {detail}"),
         }
     }
 }
