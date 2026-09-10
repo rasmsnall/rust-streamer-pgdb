@@ -188,6 +188,19 @@ pub enum Error {
         detail: String,
     },
 
+    /// The output prefix points at storage a catalog manages for itself.
+    ///
+    /// Unity Catalog managed tables, and the legacy Hive warehouse, assume the catalog is
+    /// the only writer. A third-party writer can leave them inconsistent in ways that do
+    /// not surface as a clean error, so this is refused rather than attempted. Write to an
+    /// external location and register the result instead.
+    ManagedTableTarget {
+        /// The rejected prefix. A location, never data.
+        uri: String,
+        /// Which marker in the path identified it.
+        marker: &'static str,
+    },
+
     /// A phase-two commit failed part way through the burst.
     ///
     /// This is the one variant that may mean the load left **visible change** behind.
@@ -306,6 +319,10 @@ impl fmt::Display for Error {
                 f,
                 "schema of table {table} differs from the Delta table ({detail}); \
                  only overwrite mode may change a schema"
+            ),
+            Error::ManagedTableTarget { uri, marker } => write!(
+                f,
+                "output prefix {uri} is catalog-managed storage (matched {marker});                  write to an external location and register the tables instead"
             ),
             Error::Internal { detail } => write!(f, "internal invariant violated: {detail}"),
         }

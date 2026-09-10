@@ -63,7 +63,9 @@ use crate::copy::{self, Limits};
 use crate::dump::{ChunkReader, decompressed};
 use crate::error::{Error, Result};
 use crate::scan::{Event, Scanner, TableDef, TableName};
-use crate::sink::{SchemaDrift, TableWriter, WriteMode, commit_table, open_table};
+use crate::sink::{
+    SchemaDrift, TableWriter, WriteMode, commit_table, open_table, reject_managed_storage,
+};
 use crate::types::{self, ResolvedType};
 
 /// Per-worker job queue depth. Bounds how many undecoded chunks can be in flight per
@@ -99,6 +101,16 @@ pub struct LoadConfig {
     /// When set, the load fails unless the dump's `pg_dump` major matches exactly. This
     /// is the tripwire for the source system being upgraded without notice.
     pub expect_pg_major: Option<u32>,
+    /// Qualified names this dump is expected to contain, normally the previous run's set.
+    ///
+    /// Purely a report: it neither filters nor fails the load. When set,
+    /// [`LoadReport::missing_tables`] and [`LoadReport::unexpected_tables`] say how the
+    /// dump differed. The table set of a third-party feed drifts, and nothing else
+    /// notices a table that simply stopped arriving.
+    ///
+    /// When this is `None` but [`LoadConfig::tables`] is set, the filter doubles as the
+    /// expectation for the missing check, so a name that never appears is not silent.
+    pub expect_tables: Option<Vec<String>>,
     /// Bounds enforced on every field, row, and column while decoding. `max_row_bytes`
     /// also caps how far the reader will grow a chunk around one very long line.
     pub limits: Limits,
@@ -115,6 +127,7 @@ impl Default for LoadConfig {
             threads: 0,
             storage_options: HashMap::new(),
             expect_pg_major: None,
+            expect_tables: None,
             limits: Limits::default(),
         }
     }
@@ -175,6 +188,17 @@ pub struct LoadReport {
     pub total_rows: u64,
     /// One entry per loaded table, in the order their blocks closed.
     pub tables: Vec<TableStats>,
+    /// Expected names that the dump did not contain, sorted.
+    ///
+    /// A table that stops arriving is left exactly as it was, so it silently serves the
+    /// previous run's data. Nothing else detects that. Empty when
+    /// [`LoadConfig::expect_tables`] and [`LoadConfig::tables`] are both `None`.
+    pub missing_tables: Vec<String>,
+    /// Names the dump contained that [`LoadConfig::expect_tables`] did not list, sorted.
+    ///
+    /// Always empty when `expect_tables` is `None`, since without an expectation nothing
+    /// can be unexpected.
+    pub unexpected_tables: Vec<String>,
 }
 
 /// Resolves each `COPY` column against the table's `CREATE TABLE` definition.
@@ -339,6 +363,10 @@ where
     R: std::io::Read + 'static,
     F: FnMut(Progress) -> bool,
 {
+    // Checked before anything is opened or spawned, so an unusable target fails in a
+    // second rather than after the dump has been decoded.
+    reject_managed_storage(&config.output_uri)?;
+
     let threads = match config.threads {
         0 => std::thread::available_parallelism()
             .map(|n| n.get())
@@ -491,6 +519,9 @@ where
     let mut chunks = ChunkReader::with_limits(reader, crate::dump::DEFAULT_CHUNK_BYTES, max_chunk);
     let mut scanner = Scanner::new();
 
+    // Every table whose COPY block was seen, filtered or not, so the comparison is
+    // against the dump rather than against what this run chose to load.
+    let mut seen_tables: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut table_defs: HashMap<String, TableDef> = HashMap::new();
     let mut dumped_by: Option<u32> = None;
     let mut from_database: Option<u32> = None;
@@ -542,6 +573,7 @@ where
                         });
                     }
                     let qualified = table.qualified();
+                    seen_tables.insert(qualified.clone());
                     if !wanted(&qualified) {
                         skipping = true;
                         continue;
@@ -756,9 +788,38 @@ where
         }
     }
 
+    // The expectation is expect_tables when given, otherwise the filter, so that a name
+    // in `tables` which never appears is reported rather than silently loading nothing.
+    let expectation = config.expect_tables.as_ref().or(config.tables.as_ref());
+    let missing_tables: Vec<String> = expectation
+        .map(|names| {
+            let mut absent: Vec<String> = names
+                .iter()
+                .filter(|name| !seen_tables.contains(*name))
+                .cloned()
+                .collect();
+            absent.sort();
+            absent.dedup();
+            absent
+        })
+        .unwrap_or_default();
+    let unexpected_tables: Vec<String> = config
+        .expect_tables
+        .as_ref()
+        .map(|names| {
+            seen_tables
+                .iter()
+                .filter(|seen| !names.contains(*seen))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+
     Ok(LoadReport {
         dumped_by,
         from_database,
+        missing_tables,
+        unexpected_tables,
         compression: compression.name(),
         bytes_read: consumed.load(Ordering::Relaxed),
         total_rows,

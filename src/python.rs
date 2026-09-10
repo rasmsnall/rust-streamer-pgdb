@@ -168,13 +168,26 @@ pub struct PyLoadReport {
     total_rows: u64,
     /// One [`PyTableStats`] per loaded table, in the order their blocks closed.
     tables: Vec<Py<PyTableStats>>,
+    /// Expected names the dump did not contain. Empty unless ``expect_tables`` or
+    /// ``tables`` was given.
+    missing_tables: Vec<String>,
+    /// Names the dump contained that ``expect_tables`` did not list. Always empty unless
+    /// ``expect_tables`` was given.
+    unexpected_tables: Vec<String>,
 }
 
 #[pymethods]
 impl PyLoadReport {
     fn __repr__(&self) -> String {
+        let mut extra = String::new();
+        if !self.missing_tables.is_empty() {
+            extra.push_str(&format!(", missing={}", self.missing_tables.len()));
+        }
+        if !self.unexpected_tables.is_empty() {
+            extra.push_str(&format!(", unexpected={}", self.unexpected_tables.len()));
+        }
         format!(
-            "LoadReport(dumped_by={}, tables={}, total_rows={})",
+            "LoadReport(dumped_by={}, tables={}, total_rows={}{extra})",
             self.dumped_by,
             self.tables.len(),
             self.total_rows
@@ -229,6 +242,11 @@ fn parse_mode(mode: &str) -> PyResult<WriteMode> {
 ///     Backend options passed through to ``object_store``.
 /// expect_pg_major : int | None
 ///     When set, the load fails unless the dump's ``pg_dump`` major matches exactly.
+/// expect_tables : list[str] | None
+///     Qualified names this dump is expected to contain, normally the previous run's set.
+///     Purely a report: it neither filters nor fails the load. See ``missing_tables`` and
+///     ``unexpected_tables`` on the result. When omitted, ``tables`` doubles as the
+///     expectation for the missing check.
 /// max_field_bytes, max_row_bytes, max_columns : int | None
 ///     Override the decode limits that protect the driver from a hostile dump.
 /// progress : callable | None
@@ -257,6 +275,10 @@ fn parse_mode(mode: &str) -> PyResult<WriteMode> {
 ///     Subclasses ``RuntimeError``.
 /// RuntimeError
 ///     The Delta or Arrow write path failed, or an internal invariant was violated.
+/// ValueError
+///     ``output_uri`` points at Unity Catalog managed storage or the legacy Hive
+///     warehouse. Those assume the catalog is their only writer. Use an external location
+///     and register the tables.
 /// OSError
 ///     The dump could not be read.
 /// KeyboardInterrupt
@@ -288,6 +310,7 @@ fn parse_mode(mode: &str) -> PyResult<WriteMode> {
     threads = None,
     storage_options = None,
     expect_pg_major = None,
+    expect_tables = None,
     max_field_bytes = None,
     max_row_bytes = None,
     max_columns = None,
@@ -305,6 +328,7 @@ fn stream_dump_to_delta(
     threads: Option<usize>,
     storage_options: Option<HashMap<String, String>>,
     expect_pg_major: Option<u32>,
+    expect_tables: Option<Vec<String>>,
     max_field_bytes: Option<usize>,
     max_row_bytes: Option<usize>,
     max_columns: Option<usize>,
@@ -320,6 +344,7 @@ fn stream_dump_to_delta(
         threads: threads.unwrap_or(0),
         storage_options: storage_options.unwrap_or_default(),
         expect_pg_major,
+        expect_tables,
         limits: Limits {
             max_field_bytes: max_field_bytes.unwrap_or(defaults.max_field_bytes),
             max_row_bytes: max_row_bytes.unwrap_or(defaults.max_row_bytes),
@@ -377,6 +402,8 @@ fn stream_dump_to_delta(
         .collect::<PyResult<Vec<_>>>()?;
 
     Ok(PyLoadReport {
+        missing_tables: report.missing_tables,
+        unexpected_tables: report.unexpected_tables,
         dumped_by: report.dumped_by,
         from_database: report.from_database,
         compression: report.compression.to_string(),

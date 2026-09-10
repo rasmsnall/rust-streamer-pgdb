@@ -25,6 +25,7 @@
   - 1. `LoadReport`
   - 2. `TableStats`
   - 3. Reading the statistics
+  - 4. A drifting table set
 - IV. Rust Surface
   - 1. Entry points
   - 2. `LoadConfig`
@@ -169,6 +170,7 @@ which is idempotent in `overwrite` mode. See `architecture.md`, Chapter VI, Sect
 | `threads` | `int` or `None` | `None` | Decode and Parquet-encode workers. `None` uses the machine's parallelism |
 | `storage_options` | `dict[str, str]` or `None` | `None` | Backend options passed through to `object_store` |
 | `expect_pg_major` | `int` or `None` | `None` | When set, the load fails unless the dump's `pg_dump` major matches exactly |
+| `expect_tables` | `list[str]` or `None` | `None` | Names this dump is expected to contain. Reports only; see Chapter III, Section 4 |
 | `max_field_bytes` | `int` or `None` | 64 MiB | Largest single field permitted |
 | `max_row_bytes` | `int` or `None` | 256 MiB | Largest single row permitted. Also bounds reader buffering |
 | `max_columns` | `int` or `None` | 1600 | Largest field count permitted. The default is PostgreSQL's own limit |
@@ -201,6 +203,7 @@ raises.
 | `ValueError` | The dump is wrong: a truncated `COPY` block, a row whose field count disagrees with its header, a bad escape, a value contradicting its column type, an unqualified or mismatched `pg_dump` major, or a table name that would escape the prefix |
 | `PartialCommitError` | A commit failed part way through the final burst. **The only failure that can leave visible change behind.** Subclasses `RuntimeError` |
 | `RuntimeError` | The Delta or Arrow write path failed, or an internal invariant of the library was violated |
+| `ValueError`, managed storage | `output_uri` points at Unity Catalog managed storage or the legacy Hive warehouse. Refused before anything is opened |
 | `OSError` | The dump could not be read |
 | `KeyboardInterrupt` | The load was interrupted by a signal |
 
@@ -273,6 +276,8 @@ described in Section 5, and nothing is committed.
 | `bytes_read` | `int` | Bytes taken from the input, counted before decompression |
 | `total_rows` | `int` | Rows decoded across every loaded table |
 | `tables` | `list[TableStats]` | One entry per loaded table, in the order their blocks closed |
+| `missing_tables` | `list[str]` | Expected names the dump did not contain |
+| `unexpected_tables` | `list[str]` | Names the dump contained that `expect_tables` did not list |
 
 Instances are immutable.
 
@@ -318,6 +323,39 @@ Section 2.
 `batches` is a diagnostic rather than a fidelity signal. A table whose `batches` count is
 far larger than `rows / batch_rows` was flushed by the byte bound rather than the row
 bound, which usually means wide rows.
+
+### 4. A drifting table set
+
+The table set of a third-party feed drifts. `expect_tables` is how a run says what it
+thought it was getting, and the report says how that differed.
+
+```python
+report = pgdelta.stream_dump_to_delta(
+    dump, output, expect_tables=yesterdays_table_names
+)
+if report.missing_tables:
+    alert(f"stopped arriving: {report.missing_tables}")
+if report.unexpected_tables:
+    alert(f"new since yesterday: {report.unexpected_tables}")
+```
+
+Neither fails the load, deliberately. A drifting set is the normal condition of this feed,
+and failing over it would mean a human intervening most days.
+
+`missing_tables` is the one that matters operationally. **A table absent from the dump is
+not emptied and not deleted; it is left exactly as it was**, so it silently keeps serving
+the previous run's data. Nothing else detects that, and a downstream consumer has no way
+to tell yesterday's rows from today's.
+
+`unexpected_tables` is computed only when `expect_tables` is given, since without an
+expectation nothing can be unexpected.
+
+If `expect_tables` is omitted but `tables` is given, the filter doubles as the expectation
+for the missing check. A name in `tables` that never appears in the dump loads nothing at
+all, and that used to be silent.
+
+Note that a table excluded by the `tables` filter is still *seen*: its `COPY` block is
+scanned past, so its name is known and it is not counted as missing.
 
 ---
 

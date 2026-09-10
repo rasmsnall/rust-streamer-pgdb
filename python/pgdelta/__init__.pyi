@@ -111,6 +111,23 @@ class LoadReport:
     def tables(self) -> list[TableStats]:
         """One entry per loaded table, in the order their blocks closed."""
 
+    @property
+    def missing_tables(self) -> list[str]:
+        """Expected names the dump did not contain, sorted.
+
+        A table that stops arriving is left exactly as it was, so it silently serves the
+        previous run's data. Nothing else detects that. Empty unless ``expect_tables`` or
+        ``tables`` was given.
+        """
+
+    @property
+    def unexpected_tables(self) -> list[str]:
+        """Names the dump contained that ``expect_tables`` did not list, sorted.
+
+        Always empty when ``expect_tables`` was not given, since without an expectation
+        nothing can be unexpected.
+        """
+
 def stream_dump_to_delta(
     dump_path: str | PathLike[str],
     output_uri: str,
@@ -122,6 +139,7 @@ def stream_dump_to_delta(
     threads: int | None = ...,
     storage_options: Mapping[str, str] | None = ...,
     expect_pg_major: int | None = ...,
+    expect_tables: Sequence[str] | None = ...,
     max_field_bytes: int | None = ...,
     max_row_bytes: int | None = ...,
     max_columns: int | None = ...,
@@ -165,6 +183,11 @@ def stream_dump_to_delta(
     expect_pg_major:
         When set, the load fails unless the dump's ``pg_dump`` major matches exactly. This
         is the tripwire for the source system being upgraded without notice.
+    expect_tables:
+        Qualified names this dump is expected to contain, normally the previous run's set.
+        Purely a report: it neither filters nor fails the load. See
+        :attr:`LoadReport.missing_tables` and :attr:`LoadReport.unexpected_tables`. When
+        omitted, ``tables`` doubles as the expectation for the missing check.
     max_field_bytes, max_row_bytes, max_columns:
         Override the decode limits that protect the driver from a hostile dump.
     progress:

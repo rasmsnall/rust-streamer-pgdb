@@ -122,14 +122,29 @@ therefore means sizing the driver, and a large worker pool is wasted money.
 
 | Target | Supported | Notes |
 |---|---|---|
-| `/Volumes/...` FUSE path | Yes | Simplest. Needs no object-store feature |
-| External location, `abfss://` | Yes | Requires the `azure` feature and `storage_options` |
-| Unity Catalog **managed** table | **No** | Do not do this |
+| External location, `abfss://` | Yes, and preferred for the tables | Requires the `azure` feature and `storage_options` |
+| `/Volumes/...` FUSE path | Yes | Intended for landing the dump. Usable for output, but see below |
+| Unity Catalog **managed** storage | **Refused** | The load fails immediately with `ValueError` |
 
-Never write to a Unity Catalog managed table. Managed tables assume Databricks is the only
-writer; a third-party writer can corrupt them, and the failure mode is not a clean error.
-Use an external location or a Volume, and register the result if a catalog entry is
-wanted.
+The intended layout separates the file from the tables:
+
+```
+Input:    /Volumes/<catalog>/<schema>/<landing-volume>/dump.sql.gz
+Output:   abfss://<container>@<account>/bronze/<source>/public/<table>
+Register: <catalog>.<schema>.<table>, as Unity Catalog external tables
+```
+
+A Volume is the right place to land the dump, because a Volume holds files. The Delta
+tables belong in an external location, which is what a Unity Catalog external table can be
+registered against. Writing the tables into a Volume works, but it is not the arrangement
+Databricks expects and it makes registration awkward.
+
+**Managed storage is refused rather than discouraged.** A prefix containing
+`__unitystorage` or `/user/hive/warehouse` fails the load before anything is opened, so the
+failure costs a second rather than a decoded dump. Managed tables assume the catalog is
+their only writer, and an outside writer can leave them inconsistent in ways that do not
+surface as a clean error. That is precisely the class of failure this library exists to
+avoid, so it is not offered as an option.
 
 ### 4. The compatibility floor
 
@@ -348,6 +363,8 @@ Three failures are not fixable on this side, and recognising them quickly saves 
 | Per-table `rows` | Where a drop actually happened |
 | Per-table `text_fallback_columns` | A new entry means the sender introduced a type this build does not recognise |
 | Per-table `schema_drift` | Non-empty means the sender added, removed or retyped a column. This is how DDL change announces itself |
+| `missing_tables` | A table stopped arriving. It is still serving the previous run's data |
+| `unexpected_tables` | A table appeared that nobody declared. Decide whether anything downstream should consume it |
 | Per-table `null_substitutions` | A rising count means a column wants a different mapping |
 | Wall-clock duration | The trend matters more than any single run |
 
@@ -404,10 +421,20 @@ and `schema_drift` is how you find out before the query does rather than after.
 A table absent from today's dump is not loaded, and its Delta table is **left exactly as
 it was**. It is not emptied and not deleted, so it silently becomes stale.
 
-Nothing in the library detects this. Compare `report.tables` against the previous run and
-decide deliberately: mark it stale, drop it, or accept it. This is the most likely way for
-a downstream consumer to be quietly served yesterday's data, and it is called out in
-Appendix B for that reason.
+Pass the previous run's table set as `expect_tables` and the report will say so:
+
+```python
+report = pgdelta.stream_dump_to_delta(
+    DUMP, OUTPUT, mode="overwrite", expect_pg_major=17,
+    expect_tables=previous_run_table_names,
+)
+if report.missing_tables:
+    alert(f"stopped arriving, now stale: {report.missing_tables}")
+```
+
+That reports it; it does not resolve it. Deciding what a stale table should do, be marked,
+be dropped, or be left alone, is a policy question the library cannot answer, and the
+answer constrains every downstream consumer. What it no longer is, is invisible.
 
 ---
 
@@ -507,12 +534,12 @@ Stated plainly, so that nobody discovers them during an incident.
 
 | Gap | Consequence | Mitigation |
 |---|---|---|
-| A table absent from the dump is left untouched | It silently serves stale data | Compare `report.tables` run over run. See Chapter VII, Section 3 |
+| A table absent from the dump is left untouched | It silently serves stale data | Pass `expect_tables` and alert on `missing_tables`. The library reports it but will not act on it |
 | Phase 2 is not atomic across tables | A reader during the commit burst may see a mix of two days | Accept, or adopt the manifest-table pattern |
 | `VACUUM` is not run by the library | Storage grows quietly | Schedule it. See Chapter IV |
 | A `numeric` outside Arrow's decimal range becomes text without being reported | Visible only in the resulting schema | Check the schema when a numeric column reads as a string |
 | `overwrite` treats the dump as the truth, so a dropped column is dropped | A downstream query referencing it breaks | Alert on `schema_drift`; there is no merge mode |
 | Row order within a table is not preserved | Any consumer relying on insertion order breaks | Sort downstream. Delta tables are unordered sets |
-| A name in `tables` that never appears is not reported | A silent typo loads nothing | Compare your list against `report.tables` |
+| Registering the result as a Unity Catalog external table is manual | The tables exist but no catalog entry does | Run `CREATE TABLE ... LOCATION` yourself; delta-rs cannot call the catalog |
 | zstd input is rejected rather than decoded | A format change by the sender fails the load | Add the crate and a match arm before agreeing to any such change |
 | Single-node only | Ceiling in the high hundreds of gigabytes | See `architecture.md`, Chapter IV, Section 8 |

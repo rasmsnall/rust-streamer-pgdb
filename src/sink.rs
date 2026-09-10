@@ -73,6 +73,57 @@ fn delta(e: impl std::fmt::Display) -> Error {
     }
 }
 
+/// Path fragments that mark storage a catalog manages for itself.
+///
+/// Deliberately short and specific. A guess that is too broad would refuse a legitimate
+/// external location, and the failure mode of that is a load that cannot run at all.
+const MANAGED_MARKERS: &[&str] = &[
+    // Unity Catalog's managed table storage.
+    "__unitystorage",
+    // The legacy Hive metastore warehouse, managed by the same argument.
+    "/user/hive/warehouse",
+];
+
+/// Refuses an output prefix that points at catalog-managed storage.
+///
+/// Managed tables assume the catalog is their only writer. Writing Delta files underneath
+/// one from outside can leave it inconsistent in ways that do not surface as a clean
+/// error, which is precisely the class of failure this library exists to avoid. The
+/// supported layout is an external location, with the resulting tables registered.
+///
+/// Note that a `/Volumes/...` path is **not** refused. A Volume is managed, but it is
+/// intended to hold files, and landing the dump there is the documented arrangement.
+///
+/// # Errors
+///
+/// [`Error::ManagedTableTarget`] if the prefix carries a marker of managed storage.
+///
+/// # Panics
+///
+/// Does not panic.
+///
+/// # Examples
+///
+/// ```
+/// use pgdelta::sink::reject_managed_storage;
+///
+/// assert!(reject_managed_storage("abfss://c@a.dfs.core.windows.net/bronze/pg/").is_ok());
+/// assert!(reject_managed_storage("/Volumes/main/raw/pg/").is_ok());
+/// assert!(reject_managed_storage("dbfs:/user/hive/warehouse/db.db/t").is_err());
+/// ```
+pub fn reject_managed_storage(uri: &str) -> Result<()> {
+    let haystack = uri.to_ascii_lowercase();
+    for marker in MANAGED_MARKERS {
+        if haystack.contains(marker) {
+            return Err(Error::ManagedTableTarget {
+                uri: uri.to_string(),
+                marker,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Maps a table name to a path relative to the output prefix.
 ///
 /// Table names originate with a third party and `../` is a legal quoted PostgreSQL
