@@ -285,13 +285,21 @@ mod tests {
 
     #[test]
     fn file_urls_and_bare_paths_resolve_alike() {
-        assert_eq!(
-            local_path("/tmp/day.sql"),
-            std::path::PathBuf::from("/tmp/day.sql")
+        let bare = std::env::temp_dir().join("pgdelta-localpath-probe.sql");
+        assert_eq!(local_path(&bare.to_string_lossy()), bare);
+
+        let as_url = format!("file://{}", bare.to_string_lossy().replace('\\', "/"));
+        let from_url = local_path(&as_url);
+        assert!(
+            from_url.is_absolute(),
+            "{as_url} resolved to the relative {}",
+            from_url.display()
         );
         assert_eq!(
-            local_path("file:///tmp/day.sql"),
-            std::path::PathBuf::from("tmp/day.sql")
+            from_url.file_name(),
+            bare.file_name(),
+            "{as_url} resolved to {}",
+            from_url.display()
         );
     }
 }

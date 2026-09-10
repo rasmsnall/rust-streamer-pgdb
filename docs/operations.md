@@ -44,6 +44,7 @@
 - References
 - Appendix A. Runbook
 - Appendix B. Known gaps
+- Appendix D. Reading one run back as a consistent set
 
 ### List of Tables
 
@@ -396,6 +397,7 @@ Three failures are not fixable on this side, and recognising them quickly saves 
 | `unexpected_tables` | A table appeared that nobody declared. Decide whether anything downstream should consume it |
 | Per-table `null_substitutions` | A rising count means a column wants a different mapping |
 | Wall-clock duration | The trend matters more than any single run |
+| `report.load_id` | How this run is found again in the history, and how it is read back as a set |
 
 ### 2. What should page someone
 
@@ -485,6 +487,47 @@ answer constrains every downstream consumer. What it no longer is, is invisible.
 
 ---
 
+## Appendix D. Reading one run back as a consistent set
+
+The commit burst is not atomic, so a reader during it can see a mixture of two runs. The
+load history is how that is recovered after the fact rather than prevented.
+
+Every run appends a row per table to `<output_uri>/_pgdelta_loads` recording the Delta
+version that table reached. Reading every table at its recorded version reconstructs
+exactly what one run produced:
+
+```sql
+SELECT table, delta_version FROM delta.`<output>/_pgdelta_loads`
+WHERE load_id = '<load_id from the report>'
+```
+
+```python
+for row in spark.sql(query).collect():
+    path = f"{OUTPUT.rstrip('/')}/{row['table'].replace('.', '/')}"
+    spark.read.format("delta").option("versionAsOf", row["delta_version"]).load(path)
+```
+
+This is what to reach for when a downstream consumer needs a set that is internally
+consistent, or when reproducing what a report saw on a particular day.
+
+Two limits. Time travel works only while the files survive, so retention (Chapter IV)
+governs how far back a load stays readable: a seven-day `VACUUM` window means seven days
+of recoverable snapshots. And the history is a record, not a lock. Nothing stops a later
+run from overwriting a table whose version it still names.
+
+Registering the tables in Unity Catalog is a separate step, since delta-rs cannot call a
+catalog:
+
+```python
+from pgdelta.catalog import register_external_tables
+register_external_tables(spark, report, OUTPUT, "main", "bronze_pg")
+```
+
+It is idempotent, so running it after every load is the cheapest way to make a
+newly-arrived table queryable the same day.
+
+---
+
 ## Appendix C. Producing a compatibility fixture
 
 A parser bug that only reproduces on the real feed cannot be investigated if the feed
@@ -569,6 +612,7 @@ Stated plainly, so that nobody discovers them during an incident.
 | A `numeric` outside Arrow's decimal range becomes text without being reported | Visible only in the resulting schema | Check the schema when a numeric column reads as a string |
 | `overwrite` treats the dump as the truth, so a dropped column is dropped | A downstream query referencing it breaks | Alert on `schema_drift`; there is no merge mode |
 | Row order within a table is not preserved | Any consumer relying on insertion order breaks | Sort downstream. Delta tables are unordered sets |
-| Registering the result as a Unity Catalog external table is manual | The tables exist but no catalog entry does | Run `CREATE TABLE ... LOCATION` yourself; delta-rs cannot call the catalog |
+| Registering in Unity Catalog needs a Spark session | delta-rs cannot call a catalog | `pgdelta.catalog.register_external_tables`. See Appendix D |
+| The load history grows without bound | One row per table per run, so a few hundred a day | Small, but prune it if a year of history is not wanted |
 | zstd input is rejected rather than decoded | A format change by the sender fails the load | Add the crate and a match arm before agreeing to any such change |
 | Single-node only | Ceiling in the high hundreds of gigabytes | See `architecture.md`, Chapter IV, Section 8 |

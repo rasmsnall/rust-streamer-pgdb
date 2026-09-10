@@ -174,6 +174,8 @@ pub struct PyLoadReport {
     /// Names the dump contained that ``expect_tables`` did not list. Always empty unless
     /// ``expect_tables`` was given.
     unexpected_tables: Vec<String>,
+    /// Identifier of this run's rows in the load history, or ``None`` if it was disabled.
+    load_id: Option<String>,
 }
 
 #[pymethods]
@@ -252,6 +254,12 @@ fn parse_mode(mode: &str) -> PyResult<WriteMode> {
 ///     Backend options passed through to ``object_store``.
 /// expect_pg_major : int | None
 ///     When set, the load fails unless the dump's ``pg_dump`` major matches exactly.
+/// write_manifest : bool | None
+///     Append a row per table to the load history at ``<output_uri>/_pgdelta_loads``.
+///     Defaults to true. The history records the Delta version each table reached, which
+///     is what lets one run be read afterwards as a consistent set through
+///     ``VERSION AS OF``. Delta has no cross-table transaction, so this is a record made
+///     after the fact rather than a lock.
 /// expect_tables : list[str] | None
 ///     Qualified names this dump is expected to contain, normally the previous run's set.
 ///     Purely a report: it neither filters nor fails the load. See ``missing_tables`` and
@@ -322,6 +330,7 @@ fn parse_mode(mode: &str) -> PyResult<WriteMode> {
     storage_options = None,
     expect_pg_major = None,
     expect_tables = None,
+    write_manifest = None,
     max_field_bytes = None,
     max_row_bytes = None,
     max_columns = None,
@@ -330,7 +339,7 @@ fn parse_mode(mode: &str) -> PyResult<WriteMode> {
 #[allow(clippy::too_many_arguments)]
 fn stream_dump_to_delta(
     py: Python<'_>,
-    dump_path: String,
+    dump_path: &Bound<'_, PyAny>,
     output_uri: String,
     tables: Option<Vec<String>>,
     mode: &str,
@@ -341,11 +350,23 @@ fn stream_dump_to_delta(
     storage_options: Option<HashMap<String, String>>,
     expect_pg_major: Option<u32>,
     expect_tables: Option<Vec<String>>,
+    write_manifest: Option<bool>,
     max_field_bytes: Option<usize>,
     max_row_bytes: Option<usize>,
     max_columns: Option<usize>,
     progress: Option<Py<PyAny>>,
 ) -> PyResult<PyLoadReport> {
+    // A str passes through untouched so a URL keeps its "//", while anything else goes
+    // through os.fspath, which is what makes pathlib.Path work. Extracting straight to
+    // PathBuf would mangle "abfss://host/x" into "abfss:/host/x".
+    let dump_path: String = match dump_path.extract::<String>() {
+        Ok(text) => text,
+        Err(_) => dump_path
+            .extract::<std::path::PathBuf>()?
+            .to_string_lossy()
+            .into_owned(),
+    };
+
     let defaults = Limits::default();
     let config = LoadConfig {
         output_uri,
@@ -358,6 +379,7 @@ fn stream_dump_to_delta(
         storage_options: storage_options.unwrap_or_default(),
         expect_pg_major,
         expect_tables,
+        write_manifest: write_manifest.unwrap_or(true),
         limits: Limits {
             max_field_bytes: max_field_bytes.unwrap_or(defaults.max_field_bytes),
             max_row_bytes: max_row_bytes.unwrap_or(defaults.max_row_bytes),
@@ -415,6 +437,7 @@ fn stream_dump_to_delta(
         .collect::<PyResult<Vec<_>>>()?;
 
     Ok(PyLoadReport {
+        load_id: report.load_id,
         missing_tables: report.missing_tables,
         unexpected_tables: report.unexpected_tables,
         dumped_by: report.dumped_by,

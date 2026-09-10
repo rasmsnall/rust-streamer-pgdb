@@ -30,6 +30,7 @@ pub mod chan;
 pub mod copy;
 pub mod dump;
 pub mod error;
+pub mod manifest;
 pub mod pipeline;
 pub mod scan;
 pub mod sink;

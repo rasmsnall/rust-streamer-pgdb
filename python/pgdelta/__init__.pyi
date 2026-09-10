@@ -121,6 +121,20 @@ class LoadReport:
         """
 
     @property
+    def load_id(self) -> str | None:
+        """Identifier of this run's rows in the load history, or ``None`` if disabled.
+
+        Record it. It is how this run is found again, and its rows carry the Delta version
+        each table reached, which is what makes the run readable afterwards as a
+        consistent set::
+
+            SELECT table, delta_version FROM delta.`<output>/_pgdelta_loads`
+            WHERE load_id = '<load_id>'
+
+        Then read each table at its recorded version with ``VERSION AS OF``.
+        """
+
+    @property
     def unexpected_tables(self) -> list[str]:
         """Names the dump contained that ``expect_tables`` did not list, sorted.
 
@@ -141,6 +155,7 @@ def stream_dump_to_delta(
     storage_options: Mapping[str, str] | None = ...,
     expect_pg_major: int | None = ...,
     expect_tables: Sequence[str] | None = ...,
+    write_manifest: bool | None = ...,
     max_field_bytes: int | None = ...,
     max_row_bytes: int | None = ...,
     max_columns: int | None = ...,
@@ -199,6 +214,12 @@ def stream_dump_to_delta(
         Purely a report: it neither filters nor fails the load. See
         :attr:`LoadReport.missing_tables` and :attr:`LoadReport.unexpected_tables`. When
         omitted, ``tables`` doubles as the expectation for the missing check.
+    write_manifest:
+        Append a row per table to the load history at ``<output_uri>/_pgdelta_loads``.
+        Defaults to true. The history records the Delta version each table reached, which
+        is what lets one run be read afterwards as a consistent set through
+        ``VERSION AS OF``. Delta has no cross-table transaction, so this is a record made
+        after the fact rather than a lock.
     max_field_bytes, max_row_bytes, max_columns:
         Override the decode limits that protect the driver from a hostile dump.
     progress:

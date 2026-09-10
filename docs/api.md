@@ -38,6 +38,7 @@
   - 4. Timestamps and time zones
   - 5. Type fidelity
   - 6. Schema drift
+  - 7. The load history
 - VI. Worked Examples
   - 1. A daily load
   - 2. A subset load with progress
@@ -161,7 +162,7 @@ which is idempotent in `overwrite` mode. See `architecture.md`, Chapter VI, Sect
 
 | Parameter | Type | Default | Meaning |
 |---|---|---|---|
-| `dump_path` | `str` or `os.PathLike` | required | Path to the plain-text dump. gzip is detected and decoded transparently |
+| `dump_path` | `str` or `os.PathLike` | required | Local path, `file://`, or an object: `abfss://`, `az://`, `gs://`, `s3://`. Read directly, with resume. gzip decoded transparently |
 | `output_uri` | `str` | required | Prefix every table is written beneath |
 | `tables` | `list[str]` or `None` | `None` | Qualified names to load. `None` loads every table in the dump |
 | `mode` | `str` | `"overwrite"` | `"overwrite"`, `"append"` or `"error"`. See Chapter V, Section 1 |
@@ -172,6 +173,7 @@ which is idempotent in `overwrite` mode. See `architecture.md`, Chapter VI, Sect
 | `storage_options` | `dict[str, str]` or `None` | `None` | Backend options passed through to `object_store` |
 | `expect_pg_major` | `int` or `None` | `None` | When set, the load fails unless the dump's `pg_dump` major matches exactly |
 | `expect_tables` | `list[str]` or `None` | `None` | Names this dump is expected to contain. Reports only; see Chapter III, Section 4 |
+| `write_manifest` | `bool` or `None` | `True` | Append this run to the load history at `<output_uri>/_pgdelta_loads` |
 | `max_field_bytes` | `int` or `None` | 64 MiB | Largest single field permitted |
 | `max_row_bytes` | `int` or `None` | 256 MiB | Largest single row permitted. Also bounds reader buffering |
 | `max_columns` | `int` or `None` | 1600 | Largest field count permitted. The default is PostgreSQL's own limit |
@@ -285,6 +287,7 @@ described in Section 5, and nothing is committed.
 | `tables` | `list[TableStats]` | One entry per loaded table, in the order their blocks closed |
 | `missing_tables` | `list[str]` | Expected names the dump did not contain |
 | `unexpected_tables` | `list[str]` | Names the dump contained that `expect_tables` did not list |
+| `load_id` | `str` or `None` | Identifies this run's rows in the load history. See Chapter III, Section 7 |
 
 Instances are immutable.
 
@@ -550,6 +553,35 @@ the truth, and a column the dump stopped carrying is gone from the table. That i
 correct reading of a full daily snapshot, and it is why `schema_drift` is worth alerting
 on: a downstream query referencing a dropped column will break, and this is how you learn
 before the query does.
+
+### 7. The load history
+
+Every run appends one row per table to a Delta table at `<output_uri>/_pgdelta_loads`,
+unless `write_manifest=False`. `report.load_id` identifies the run's rows.
+
+The row records the **Delta version each table reached**, and that is the point. Delta has
+no cross-table transaction, so a set of tables cannot be committed atomically. What the
+history gives is the ability to reconstruct one run afterwards:
+
+```python
+versions = spark.sql(pgdelta.catalog.snapshot_sql(output_uri, report.load_id))
+for row in versions.collect():
+    path = f"{output_uri.rstrip('/')}/{row['table'].replace('.', '/')}"
+    df = spark.read.format("delta").option("versionAsOf", row["delta_version"]).load(path)
+```
+
+Every table read at its recorded version is by construction the set that run produced,
+whatever has happened since. Consistency is recovered after the fact rather than enforced
+at write time, which is the only thing Delta permits.
+
+A table that was expected and did not arrive gets a row too, with `status = 'missing'` and
+no version. That is deliberate: it is the most consequential thing that can happen to a
+feed, and a history that simply omitted it would be misleading.
+
+Two limits worth stating plainly. Time travel only works while the files survive, so once
+`VACUUM` passes its retention window an older load stops being readable. And this is a
+record, not a lock: nothing stops a later run from overwriting a table whose version the
+history still names.
 
 ---
 

@@ -258,6 +258,52 @@ def main() -> int:
     else:
         raise SystemExit("FAIL: append accepted a changed schema")
 
+    # --- the load history -------------------------------------------------------------
+    check(report.load_id is not None, "a load id should be returned")
+    check(second.load_id != report.load_id, "each run needs its own load id")
+    history = DeltaTable(str(out / "_pgdelta_loads")).to_pyarrow_table().to_pylist()
+    mine = [r for r in history if r["load_id"] == report.load_id]
+    check(len(mine) == len(EXPECTED_TABLES), f"one history row per table, got {len(mine)}")
+    check(all(r["status"] == "loaded" for r in mine), "all were loaded")
+    check(all(r["delta_version"] is not None for r in mine), "versions were recorded")
+    check(
+        len(history) == len(EXPECTED_TABLES) + len(second.tables),
+        "the second run appended rather than replacing",
+    )
+
+    # The version the history recorded must reconstruct the first run, which is the whole
+    # reason it exists: Delta has no cross-table transaction.
+    staging_version = next(r["delta_version"] for r in mine if r["table"] == "public.staging")
+    old_staging = DeltaTable(str(out / "public" / "staging"), version=staging_version)
+    check(
+        [f.name for f in old_staging.schema().fields] == ["id", "note"],
+        "the recorded version reads back as the first run's schema",
+    )
+
+    # --- catalog SQL, without needing Spark ---------------------------------------------
+    from pgdelta.catalog import external_table_sql, snapshot_sql
+
+    statements = external_table_sql(report, uri, "main", "bronze_pg")
+    check(len(statements) == len(EXPECTED_TABLES), "one statement per loaded table")
+    check(
+        any("public_staging" in s for s in statements),
+        f"the source schema becomes part of the name: {statements}",
+    )
+    check("_pgdelta_loads" in snapshot_sql(uri, report.load_id), "snapshot SQL names the history")
+
+    class _Fake:
+        def __init__(self, name):
+            self.tables = [type("S", (), {"table": name})()]
+
+    for hostile in ["users`; DROP TABLE x; --", "a'b", "x`y", ""]:
+        try:
+            external_table_sql(_Fake(f"public.{hostile}"), uri, "main", "s")
+        except ValueError:
+            pass
+        else:
+            raise SystemExit(f"FAIL: {hostile!r} was interpolated into SQL")
+    print("  PASS  hostile identifiers are refused rather than quoted")
+
     print("OK")
     return 0
 

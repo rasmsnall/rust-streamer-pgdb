@@ -129,6 +129,12 @@ pub struct LoadConfig {
     /// Bounds enforced on every field, row, and column while decoding. `max_row_bytes`
     /// also caps how far the reader will grow a chunk around one very long line.
     pub limits: Limits,
+    /// Append a row per table to the load history at `<output_uri>/_pgdelta_loads`.
+    ///
+    /// On by default. The history records the Delta version each table reached, which is
+    /// what makes one run readable afterwards as a consistent set through
+    /// `VERSION AS OF`. See [`crate::manifest`].
+    pub write_manifest: bool,
 }
 
 impl Default for LoadConfig {
@@ -145,6 +151,7 @@ impl Default for LoadConfig {
             expect_pg_major: None,
             expect_tables: None,
             limits: Limits::default(),
+            write_manifest: true,
         }
     }
 }
@@ -215,6 +222,12 @@ pub struct LoadReport {
     /// Always empty when `expect_tables` is `None`, since without an expectation nothing
     /// can be unexpected.
     pub unexpected_tables: Vec<String>,
+    /// Identifier of the row group written to the load history, when one was written.
+    ///
+    /// `None` when [`LoadConfig::write_manifest`] is off. Record it: it is how this run is
+    /// found again, and its rows carry the versions that make the run readable as a
+    /// consistent set.
+    pub load_id: Option<String>,
 }
 
 /// Resolves each `COPY` column against the table's `CREATE TABLE` definition.
@@ -668,6 +681,11 @@ where
                             detail: "COPY block started while another was still open",
                         });
                     }
+                    if config.write_manifest && crate::manifest::reserved_collision(&table) {
+                        return Err(Error::UnsafeTableName {
+                            name: table.qualified(),
+                        });
+                    }
                     let qualified = table.qualified();
                     seen_tables.insert(qualified.clone());
                     if !wanted(&qualified) {
@@ -940,7 +958,8 @@ where
         })
         .unwrap_or_default();
 
-    Ok(LoadReport {
+    let mut report = LoadReport {
+        load_id: None,
         dumped_by,
         from_database,
         missing_tables,
@@ -949,7 +968,21 @@ where
         bytes_read: consumed.load(Ordering::Relaxed),
         total_rows,
         tables,
-    })
+    };
+
+    // After the tables are visible, because the history records the versions they reached.
+    // A failure here means the data landed but the audit record did not, which is worth an
+    // error rather than a shrug: re-running is safe and restores both.
+    if config.write_manifest {
+        let load_id = handle.block_on(crate::manifest::append(
+            &config.output_uri,
+            &config.storage_options,
+            &report,
+        ))?;
+        report.load_id = Some(load_id);
+    }
+
+    Ok(report)
 }
 
 /// A decode worker. Owns its own [`TableWriter`] per block, so Parquet encoding runs here
