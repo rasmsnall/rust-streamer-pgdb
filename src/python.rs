@@ -102,6 +102,10 @@ pub struct PyTableStats {
     /// `{column: declared_type}` for columns written as text because the type was not
     /// recognised.
     text_fallback_columns: HashMap<String, String>,
+    /// `{"added": [...], "removed": [...], "retyped": [[column, was, now], ...]}` for how
+    /// this run's schema differed from the one the Delta table already declared. All three
+    /// lists are empty on a first run and on any run whose DDL is unchanged.
+    schema_drift: HashMap<String, Vec<Vec<String>>>,
 }
 
 #[pymethods]
@@ -123,6 +127,28 @@ impl From<TableStats> for PyTableStats {
             delta_version: s.delta_version,
             null_substitutions: s.null_substitutions.into_iter().collect(),
             text_fallback_columns: s.text_fallback_columns.into_iter().collect(),
+            schema_drift: HashMap::from([
+                (
+                    "added".to_string(),
+                    s.schema_drift.added.into_iter().map(|c| vec![c]).collect(),
+                ),
+                (
+                    "removed".to_string(),
+                    s.schema_drift
+                        .removed
+                        .into_iter()
+                        .map(|c| vec![c])
+                        .collect(),
+                ),
+                (
+                    "retyped".to_string(),
+                    s.schema_drift
+                        .retyped
+                        .into_iter()
+                        .map(|(column, was, now)| vec![column, was, now])
+                        .collect(),
+                ),
+            ]),
         }
     }
 }
@@ -222,8 +248,8 @@ fn parse_mode(mode: &str) -> PyResult<WriteMode> {
 /// ValueError
 ///     A malformed dump: a truncated ``COPY`` block, a row whose field count disagrees
 ///     with its ``COPY`` header, a bad escape, a value that contradicts its column type,
-///     an unqualified or mismatched ``pg_dump`` major, or a table name that escapes the
-///     prefix.
+///     an unqualified or mismatched ``pg_dump`` major, a table name that escapes the
+///     prefix, or a schema change under ``append`` mode.
 /// PartialCommitError
 ///     A commit failed part way through the final burst, so some tables hold this run's
 ///     contents and the rest hold the previous run's. Carries ``table``, ``committed`` and
@@ -235,6 +261,14 @@ fn parse_mode(mode: &str) -> PyResult<WriteMode> {
 ///     The dump could not be read.
 /// KeyboardInterrupt
 ///     The load was interrupted. Nothing was committed.
+///
+/// Schema drift
+/// ------------
+/// The sender controls the schema and changes it without notice. Under ``overwrite`` the
+/// table is rewritten wholesale, so an added, removed or retyped column is applied and
+/// reported in ``TableStats.schema_drift``. Under ``append`` a change is refused with
+/// ``ValueError``, because appending rows shaped one way to a table declared another way
+/// cannot be made to mean anything.
 ///
 /// Notes
 /// -----

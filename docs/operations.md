@@ -310,6 +310,7 @@ day's dump and are certain of which ones they were.
 | `ValueError`, unqualified `pg_dump` major | The sender upgraded PostgreSQL | See Chapter VII, Section 1. Do not simply raise `expect_pg_major` |
 | `ValueError`, field count mismatch | The dump is malformed or the DDL was misparsed | Capture the table name and raise it with the sender. This is not tuneable |
 | `ValueError`, unsafe table name | A table name contains a character the path mapping rejects | See `api.md`, Chapter V, Section 3 |
+| `ValueError`, schema differs | The sender changed a column and the run used `append` | Only `overwrite` may change a schema. Confirm the change is intended, then use `overwrite` |
 | `ValueError`, field or row too large | A legitimately wide row, or a hostile dump | Raise `max_field_bytes` or `max_row_bytes` only after confirming the row is genuine |
 | `PartialCommitError`, `committed` is 0 | The commit burst failed on its first table | Nothing became visible. Fix the cause and re-run |
 | `PartialCommitError`, `committed` above 0 | The commit burst failed part way | `committed` tables are on the new day, the rest on the old. Re-run as soon as the cause is fixed |
@@ -346,6 +347,7 @@ Three failures are not fixable on this side, and recognising them quickly saves 
 | `len(report.tables)` | The table set drifts. A change is worth knowing about |
 | Per-table `rows` | Where a drop actually happened |
 | Per-table `text_fallback_columns` | A new entry means the sender introduced a type this build does not recognise |
+| Per-table `schema_drift` | Non-empty means the sender added, removed or retyped a column. This is how DDL change announces itself |
 | Per-table `null_substitutions` | A rising count means a column wants a different mapping |
 | Wall-clock duration | The trend matters more than any single run |
 
@@ -355,8 +357,10 @@ Page on a failed load, since the day's data is missing and the window to re-fetc
 sender may be limited.
 
 Alert, without paging, on a row count that moves by more than an expected margin against
-the previous run, on a change in the table count, and on a new `text_fallback_columns`
-entry. None of these is an error, and all three are how schema drift announces itself.
+the previous run, on a change in the table count, on a new `text_fallback_columns` entry,
+and on any non-empty `schema_drift`. None of these is an error, and all four are how the
+sender's changes announce themselves. A non-empty `schema_drift` in particular means the
+Delta schema has just changed underneath every downstream consumer of that table.
 
 Do not alert on `null_substitutions` alone unless the count is rising run over run.
 
@@ -381,15 +385,19 @@ concentrated in DDL, which is exactly what the tripwire protects.
 The sender controls the schema and will change it without notice. Three cases behave
 differently.
 
-- **A new column** appears in both the `CREATE TABLE` and the `COPY` header, so it is
-  picked up automatically. In `overwrite` mode the Delta schema is replaced along with the
-  data. In `append` mode a schema mismatch will fail the write.
+- **A new, removed or retyped column** is picked up from the `CREATE TABLE` and the
+  `COPY` header. Under `overwrite` the Delta schema is replaced in the same commit that
+  replaces the data, so the declared columns and the files always agree, and the change is
+  reported per table in `schema_drift`. Under `append` the load fails with `ValueError`
+  naming the table and the columns, because appending rows shaped one way to a table
+  declared another way cannot be made to mean anything.
 - **A new type** this build does not recognise degrades to text and shows up in
   `text_fallback_columns`. The load succeeds. Decide later whether the type deserves a real
   mapping.
-- **A removed column** simply stops appearing. In `overwrite` mode the new schema no longer
-  has it. Downstream queries referencing it will break, which is the correct outcome and is
-  why the table count and column set are worth monitoring.
+
+A removed column is worth calling out separately: under `overwrite` the new schema no
+longer has it, so a downstream query referencing it breaks. That is the correct outcome,
+and `schema_drift` is how you find out before the query does rather than after.
 
 ### 3. A table that disappears
 
@@ -418,6 +426,40 @@ Appendix B for that reason.
    https://www.postgresql.org/docs/17/app-pgdump.html
 7. maturin Project. *maturin User Guide*. https://www.maturin.rs/
 8. zlib-ng Project. *zlib-ng*. https://github.com/zlib-ng/zlib-ng
+
+---
+
+## Appendix C. Producing a compatibility fixture
+
+A parser bug that only reproduces on the real feed cannot be investigated if the feed
+cannot leave your environment. `tools/anonymise_dump.py` exists for that case.
+
+```
+python tools/anonymise_dump.py /Volumes/main/landing/pg/day.sql fixture.sql     --max-rows 200 --audit
+```
+
+It runs where the dump already is. It opens no network connection and imports nothing
+outside the standard library, so it can be read in full before being trusted.
+
+It preserves what breaks parsers: every DDL construct verbatim, every `COPY` header and
+column order, and per field the NULL-ness, the length and the character classes, so
+escapes, multi-byte characters and long values still occur where they did. It replaces
+every data byte with a value derived from the field's position under a per-run key, never
+from its content, so the output cannot be correlated back even by someone holding both
+files.
+
+Dates, timestamps, numbers and booleans are regenerated as valid values of their kind
+rather than having their characters replaced. This matters: scrambling the digits of
+`2026-01-31` yields `2099-45-99`, which is not a date, and a fixture that will not load
+tests nothing.
+
+`--audit` re-reads both files afterwards and fails if any token of six or more characters
+from a data field survived. That catches the failure that matters, a value passed through
+untouched, but it cannot prove the result is safe. **Read the output before sharing it.**
+
+Add `--rename-identifiers` if table and column names are themselves sensitive. It is off
+by default because a parser bug is often tied to the exact characters in a name, and
+renaming would hide the very thing being reported.
 
 ---
 
@@ -469,6 +511,7 @@ Stated plainly, so that nobody discovers them during an incident.
 | Phase 2 is not atomic across tables | A reader during the commit burst may see a mix of two days | Accept, or adopt the manifest-table pattern |
 | `VACUUM` is not run by the library | Storage grows quietly | Schedule it. See Chapter IV |
 | A `numeric` outside Arrow's decimal range becomes text without being reported | Visible only in the resulting schema | Check the schema when a numeric column reads as a string |
+| `overwrite` treats the dump as the truth, so a dropped column is dropped | A downstream query referencing it breaks | Alert on `schema_drift`; there is no merge mode |
 | Row order within a table is not preserved | Any consumer relying on insertion order breaks | Sort downstream. Delta tables are unordered sets |
 | A name in `tables` that never appears is not reported | A silent typo loads nothing | Compare your list against `report.tables` |
 | zstd input is rejected rather than decoded | A format change by the sender fails the load | Add the crate and a match arm before agreeing to any such change |

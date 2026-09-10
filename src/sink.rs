@@ -28,12 +28,13 @@
 //! trusting it, because a delta-rs upgrade could raise the default silently.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use deltalake::arrow::array::RecordBatch;
-use deltalake::arrow::datatypes::Schema as ArrowSchema;
+use deltalake::arrow::datatypes::{Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
 use deltalake::kernel::engine::arrow_conversion::TryIntoKernel;
 use deltalake::kernel::transaction::{CommitBuilder, TableReference};
-use deltalake::kernel::{Action, StructType};
+use deltalake::kernel::{Action, MetadataExt, StructType};
 use deltalake::protocol::{DeltaOperation, SaveMode};
 use deltalake::table::builder::ensure_table_uri;
 use deltalake::writer::{DeltaWriter, RecordBatchWriter};
@@ -174,16 +175,114 @@ async fn current_files(table: &DeltaTable) -> Result<Vec<Action>> {
         .map_err(delta)
 }
 
+/// How the dump's schema for a table differs from the one Delta currently declares.
+///
+/// Empty on a first run, and empty on any later run whose DDL is unchanged. A third party
+/// controls the schema and changes it without notice, so this is reported per table in the
+/// run statistics rather than discovered by a downstream query.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SchemaDrift {
+    /// Columns the dump carries that the Delta table does not.
+    pub added: Vec<String>,
+    /// Columns the Delta table has that the dump no longer carries.
+    pub removed: Vec<String>,
+    /// Columns present in both whose type changed, as `(column, was, now)`.
+    pub retyped: Vec<(String, String, String)>,
+}
+
+impl SchemaDrift {
+    /// True when the dump and the table agree.
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty() && self.retyped.is_empty()
+    }
+
+    /// One-line description naming the columns involved.
+    ///
+    /// Carries column names and type names only, never a value, because this reaches
+    /// error text and the dump is untrusted.
+    ///
+    /// # Panics
+    ///
+    /// Does not panic.
+    pub fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.added.is_empty() {
+            parts.push(format!("added {}", self.added.join(", ")));
+        }
+        if !self.removed.is_empty() {
+            parts.push(format!("removed {}", self.removed.join(", ")));
+        }
+        for (column, was, now) in &self.retyped {
+            parts.push(format!("{column} changed from {was} to {now}"));
+        }
+        if parts.is_empty() {
+            "no change".to_string()
+        } else {
+            parts.join("; ")
+        }
+    }
+}
+
+/// Compares the dump's schema against the one the table currently declares.
+///
+/// Both sides are kernel types. Comparing an Arrow type against a Delta one as rendered
+/// text cannot work, because the two spell the same type differently: the kernel writes
+/// `Primitive(Integer)` where Arrow writes `Int32`, so every column would look retyped.
+/// Converting first also means this agrees with [`commit_table`] by construction, since
+/// that decides whether to emit a `Metadata` action from the same comparison.
+fn diff_schema(current: &StructType, incoming: &StructType) -> SchemaDrift {
+    let mut drift = SchemaDrift::default();
+
+    for field in incoming.fields() {
+        match current.fields().find(|f| f.name() == field.name()) {
+            None => drift.added.push(field.name().to_string()),
+            Some(existing) => {
+                if existing.data_type() != field.data_type() {
+                    drift.retyped.push((
+                        field.name().to_string(),
+                        existing.data_type().to_string(),
+                        field.data_type().to_string(),
+                    ));
+                }
+            }
+        }
+    }
+    for field in current.fields() {
+        if !incoming.fields().any(|f| f.name() == field.name()) {
+            drift.removed.push(field.name().to_string());
+        }
+    }
+    drift
+}
+
+/// A Delta table opened for one source table, with whatever its schema drifted by.
+#[derive(Debug)]
+pub struct OpenedTable {
+    /// The loaded table, ready to be written to and later committed.
+    pub table: DeltaTable,
+    /// Fully qualified URI, which a [`TableWriter`] needs in order to write the dump's
+    /// schema rather than the table's current one.
+    pub uri: String,
+    /// How the dump's schema differs from what the table declared on entry.
+    pub drift: SchemaDrift,
+}
+
 /// Opens the Delta table for `table_name` beneath `prefix`, creating it on a first run.
 ///
 /// The returned table is loaded and ready for a [`TableWriter`]. Creation is the only
 /// step that must happen once per table rather than once per writer, so the parallel
 /// pipeline calls this on the reader thread before fanning work to the decode pool.
 ///
+/// The incoming `schema` is compared against the table's current one and the difference is
+/// returned. Under [`WriteMode::Overwrite`] a difference is legal and is applied by
+/// [`commit_table`]; under [`WriteMode::Append`] it is refused, because appending rows
+/// shaped one way to a table declared another way cannot be made to mean anything.
+///
 /// # Errors
 ///
 /// [`Error::UnsafeTableName`] if the name would escape the prefix, [`Error::TableExists`]
-/// if `mode` is [`WriteMode::ErrorIfExists`] and the table already holds data, and
+/// if `mode` is [`WriteMode::ErrorIfExists`] and the table already holds data,
+/// [`Error::SchemaChanged`] if `mode` is [`WriteMode::Append`] and the schema differs, and
 /// [`Error::Delta`] for a storage or protocol failure.
 ///
 /// # Panics
@@ -195,7 +294,7 @@ pub async fn open_table(
     schema: &ArrowSchema,
     mode: WriteMode,
     storage_options: &HashMap<String, String>,
-) -> Result<DeltaTable> {
+) -> Result<OpenedTable> {
     let uri = table_uri(prefix, table_name)?;
     let url = ensure_table_uri(&uri).map_err(delta)?;
     let mut table = DeltaTableBuilder::from_url(url)
@@ -214,13 +313,32 @@ pub async fn open_table(
             .with_save_mode(SaveMode::ErrorIfExists)
             .await
             .map_err(delta)?;
-    } else if mode == WriteMode::ErrorIfExists && !current_files(&table).await?.is_empty() {
+        return Ok(OpenedTable {
+            table,
+            uri,
+            drift: SchemaDrift::default(),
+        });
+    }
+
+    if mode == WriteMode::ErrorIfExists && !current_files(&table).await?.is_empty() {
         return Err(Error::TableExists {
             table: table_name.qualified(),
         });
     }
 
-    Ok(table)
+    let drift = {
+        let incoming: StructType = schema.try_into_kernel().map_err(delta)?;
+        let snapshot = table.snapshot().map_err(delta)?;
+        diff_schema(snapshot.schema().as_ref(), &incoming)
+    };
+    if !drift.is_empty() && mode == WriteMode::Append {
+        return Err(Error::SchemaChanged {
+            table: table_name.qualified(),
+            detail: drift.summary(),
+        });
+    }
+
+    Ok(OpenedTable { table, uri, drift })
 }
 
 /// Commits `staged` against `table`, making its new contents visible in one Delta version.
@@ -229,9 +347,15 @@ pub async fn open_table(
 /// commit, so no reader observes an empty or half-replaced table. `table` is reloaded to
 /// the new version before returning.
 ///
+/// When `new_schema` is supplied and differs from what the table declares, a `Metadata`
+/// action carrying it is committed alongside the data, so the declared schema and the
+/// files agree. Without that the table would keep yesterday's schema while holding
+/// today's files. Only [`WriteMode::Overwrite`] may change a schema; see [`open_table`].
+///
 /// # Errors
 ///
-/// [`Error::Delta`] on a commit conflict or storage failure.
+/// [`Error::Delta`] on a commit conflict, a storage failure, or a schema that cannot be
+/// converted to the Delta kernel's representation.
 ///
 /// # Panics
 ///
@@ -240,12 +364,26 @@ pub async fn commit_table(
     table: &mut DeltaTable,
     staged: Vec<Action>,
     mode: WriteMode,
+    new_schema: Option<&ArrowSchema>,
 ) -> Result<u64> {
     let mut actions = staged;
 
     if mode == WriteMode::Overwrite {
         for file in current_files(table).await? {
             actions.push(file);
+        }
+
+        if let Some(schema) = new_schema {
+            let kernel: StructType = schema.try_into_kernel().map_err(delta)?;
+            let snapshot = table.snapshot().map_err(delta)?;
+            if kernel != *snapshot.schema().as_ref() {
+                let updated = snapshot
+                    .metadata()
+                    .clone()
+                    .with_schema(&kernel)
+                    .map_err(delta)?;
+                actions.push(Action::Metadata(updated));
+            }
         }
     }
 
@@ -282,18 +420,27 @@ pub struct TableWriter {
 }
 
 impl TableWriter {
-    /// Creates a writer for `table`, which must already be loaded (see [`open_table`]).
+    /// Creates a writer for the table at `uri` that writes `schema`.
+    ///
+    /// The schema is passed explicitly rather than taken from the table's metadata,
+    /// because under [`WriteMode::Overwrite`] the dump may carry a different one and the
+    /// files must be written in the shape that [`commit_table`] is about to declare.
     ///
     /// # Errors
     ///
-    /// [`Error::Delta`] if a writer cannot be derived from the table's metadata.
+    /// [`Error::Delta`] if a writer cannot be built for that location.
     ///
     /// # Panics
     ///
     /// Does not panic.
-    pub fn new(table: &DeltaTable) -> Result<Self> {
+    pub fn new(
+        uri: &str,
+        schema: ArrowSchemaRef,
+        storage_options: &HashMap<String, String>,
+    ) -> Result<Self> {
         Ok(Self {
-            writer: RecordBatchWriter::for_table(table).map_err(delta)?,
+            writer: RecordBatchWriter::try_new(uri, schema, None, Some(storage_options.clone()))
+                .map_err(delta)?,
             rows: 0,
         })
     }
@@ -339,6 +486,8 @@ pub struct TableSink {
     writer: TableWriter,
     mode: WriteMode,
     staged: Vec<Action>,
+    schema: ArrowSchemaRef,
+    drift: SchemaDrift,
 }
 
 impl TableSink {
@@ -347,8 +496,9 @@ impl TableSink {
     /// # Errors
     ///
     /// [`Error::UnsafeTableName`] if the table name would escape the prefix,
-    /// [`Error::TableExists`] under [`WriteMode::ErrorIfExists`], and [`Error::Delta`] for
-    /// a storage or protocol failure.
+    /// [`Error::TableExists`] under [`WriteMode::ErrorIfExists`],
+    /// [`Error::SchemaChanged`] under [`WriteMode::Append`] if the schema moved, and
+    /// [`Error::Delta`] for a storage or protocol failure.
     pub async fn open(
         prefix: &str,
         table_name: &TableName,
@@ -356,15 +506,23 @@ impl TableSink {
         mode: WriteMode,
         storage_options: &HashMap<String, String>,
     ) -> Result<Self> {
-        let table = open_table(prefix, table_name, schema, mode, storage_options).await?;
-        let writer = TableWriter::new(&table)?;
+        let schema: ArrowSchemaRef = Arc::new(schema.clone());
+        let opened = open_table(prefix, table_name, &schema, mode, storage_options).await?;
+        let writer = TableWriter::new(&opened.uri, Arc::clone(&schema), storage_options)?;
         Ok(Self {
             name: table_name.qualified(),
-            table,
+            table: opened.table,
             writer,
             mode,
             staged: Vec::new(),
+            schema,
+            drift: opened.drift,
         })
+    }
+
+    /// How the dump's schema differed from the table's on open.
+    pub fn drift(&self) -> &SchemaDrift {
+        &self.drift
     }
 
     /// Qualified name of the table this sink writes.
@@ -416,7 +574,8 @@ impl TableSink {
     /// [`Error::Delta`] on a commit conflict or storage failure.
     pub async fn commit(&mut self) -> Result<u64> {
         let actions = std::mem::take(&mut self.staged);
-        commit_table(&mut self.table, actions, self.mode).await
+        let schema = (!self.drift.is_empty()).then_some(self.schema.as_ref());
+        commit_table(&mut self.table, actions, self.mode, schema).await
     }
 }
 

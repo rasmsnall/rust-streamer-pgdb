@@ -71,6 +71,19 @@ class TableStats:
         """``{column: declared_type}`` for columns written as text because their declared
         PostgreSQL type was not recognised."""
 
+    @property
+    def schema_drift(self) -> dict[str, list[list[str]]]:
+        """How this run's schema differed from the one the Delta table already declared.
+
+        Shaped ``{"added": [[column], ...], "removed": [[column], ...],
+        "retyped": [[column, was, now], ...]}``. All three lists are empty on a first run
+        and on any run whose DDL is unchanged, so a non-empty value is the signal that the
+        sender changed something.
+
+        Under ``overwrite`` the change has been applied to the Delta table. Under
+        ``append`` a change raises ``ValueError`` instead and this is never reached.
+        """
+
 class LoadReport:
     """The outcome of a completed load. Instances are immutable."""
 

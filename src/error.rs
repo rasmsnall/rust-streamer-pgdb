@@ -174,6 +174,20 @@ pub enum Error {
     /// made visible. Nothing has been staged that a later run cannot overwrite.
     Interrupted,
 
+    /// The dump's schema for a table disagrees with the schema Delta declares.
+    ///
+    /// Only [`WriteMode::Overwrite`](crate::sink::WriteMode) may change a schema, because
+    /// it rewrites the table wholesale. Appending rows shaped one way to a table declared
+    /// another way cannot be made to mean anything, so it is refused.
+    ///
+    /// `detail` names the columns and their types. It never carries a value.
+    SchemaChanged {
+        /// Qualified name of the table whose schema moved.
+        table: String,
+        /// Which columns were added, removed or retyped.
+        detail: String,
+    },
+
     /// A phase-two commit failed part way through the burst.
     ///
     /// This is the one variant that may mean the load left **visible change** behind.
@@ -288,6 +302,11 @@ impl fmt::Display for Error {
                     )
                 }
             }
+            Error::SchemaChanged { table, detail } => write!(
+                f,
+                "schema of table {table} differs from the Delta table ({detail}); \
+                 only overwrite mode may change a schema"
+            ),
             Error::Internal { detail } => write!(f, "internal invariant violated: {detail}"),
         }
     }

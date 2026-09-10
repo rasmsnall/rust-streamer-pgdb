@@ -36,6 +36,7 @@
   - 3. Naming and output paths
   - 4. Timestamps and time zones
   - 5. Type fidelity
+  - 6. Schema drift
 - VI. Worked Examples
   - 1. A daily load
   - 2. A subset load with progress
@@ -292,6 +293,7 @@ differently on one day.
 | `delta_version` | `int` | Delta version the commit produced |
 | `null_substitutions` | `dict[str, int]` | Per column, values stored as NULL because the Arrow type could not represent them |
 | `text_fallback_columns` | `dict[str, str]` | Per column, the declared PostgreSQL type of a column written as text because that type was not recognised |
+| `schema_drift` | `dict[str, list[list[str]]]` | How this run's schema differed from the one the table already declared. See Chapter V, Section 6 |
 
 ### 3. Reading the statistics
 
@@ -470,6 +472,39 @@ that are not valid UTF-8 fails, because Arrow strings are UTF-8 and substituting
 replacement characters would corrupt values silently.
 
 The full mapping is `architecture.md`, Chapter VIII.
+
+### 6. Schema drift
+
+The sender controls the schema and changes it without notice, so a change is a routine
+event rather than an exception.
+
+Under `mode="overwrite"` the table is rewritten wholesale, so an added, removed or retyped
+column is **applied**: the Delta schema is replaced in the same commit that replaces the
+data, and the declared columns therefore always agree with the files. The change is
+reported per table:
+
+```python
+for stats in report.tables:
+    drift = stats.schema_drift
+    if any(drift.values()):
+        print(stats.table, drift)
+        # {'added': [['email']], 'removed': [], 'retyped': [['id', 'integer', 'string']]}
+```
+
+`added` and `removed` carry one column name per entry; `retyped` carries
+`[column, was, now]` using Delta's type names. All three are empty on a first run and on
+any run whose DDL is unchanged, so a non-empty value is exactly the signal that something
+moved.
+
+Under `mode="append"` a change is **refused** with `ValueError`, naming the table and the
+columns. Appending rows shaped one way to a table declared another way cannot be made to
+mean anything, so it fails rather than guessing.
+
+Note what this does not do. There is no merge: `overwrite` declares the dump's schema as
+the truth, and a column the dump stopped carrying is gone from the table. That is the
+correct reading of a full daily snapshot, and it is why `schema_drift` is worth alerting
+on: a downstream query referencing a dropped column will break, and this is how you learn
+before the query does.
 
 ---
 

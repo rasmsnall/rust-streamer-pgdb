@@ -43,7 +43,8 @@
 - VIII. Type Mapping
   - 1. Mapping table
   - 2. Edge cases
-  - 3. Timestamps
+  - 3. Schema changes between runs
+  - 4. Timestamps
 - IX. Security Model
 - X. Deployment Constraints
 - XI. Assessment
@@ -598,7 +599,31 @@ the operator address the source encoding, which is the real problem.
 A value that contradicts its declared type, such as text in an integer column, also fails
 the load. That is structural: the dump disagrees with its own DDL.
 
-### 3. Timestamps
+### 3. Schema changes between runs
+
+A third-party feed changes its DDL, so the schema a dump declares need not match the one
+the Delta table already carries. The two must be reconciled in the same commit, or the
+table declares one shape while its files hold another.
+
+Under [`WriteMode::Overwrite`] the dump is treated as the truth. Three things happen in one
+commit: the previous run's files are tombstoned, the new files are added, and a `Metadata`
+action carrying the dump's schema is emitted. The decode workers are given that schema
+explicitly rather than reading it from the table's metadata, because the metadata still
+describes yesterday until the commit lands.
+
+The comparison is made between kernel types on both sides. Comparing an Arrow type against
+a Delta one as rendered text does not work, since the kernel writes `Primitive(Integer)`
+where Arrow writes `Int32`, and every column would appear to have changed. Converting first
+also means the drift report and the decision to emit `Metadata` come from the same
+comparison, so they cannot disagree.
+
+Under [`WriteMode::Append`] a difference is refused. Appending rows shaped one way to a
+table declared another way has no defensible meaning, and guessing at one is exactly the
+class of silent corruption this library exists to avoid.
+
+The difference is reported per table in the run statistics, whether or not it was applied.
+
+### 4. Timestamps
 
 Delta's `timestamp` is microseconds UTC. `timestamp_ntz` requires reader v3 and writer
 v7, which breaks the compatibility floor established in Chapter X. Naive PostgreSQL

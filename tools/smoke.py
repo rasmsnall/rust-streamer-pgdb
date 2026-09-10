@@ -1,20 +1,20 @@
 """End-to-end round trip through the built wheel.
 
 Builds a small dump exercising the constructs that have broken before, loads it, and reads
-the result back with ``deltalake`` to check the values actually survived. Run it against an
-installed wheel::
+the result back with ``deltalake`` to check the values actually survived. Then loads a
+second dump whose DDL has changed, because a third-party feed does that without notice.
+Run it against an installed wheel::
 
     python tools/smoke.py
 
 Exits non-zero on the first failure, so it is usable as a CI gate. ``deltalake`` and
 ``pyarrow`` are optional: without them the load is still exercised and only the read-back
-is skipped.
+and the drift check are skipped.
 """
 
 from __future__ import annotations
 
 import gzip
-import sys
 import tempfile
 import textwrap
 from pathlib import Path
@@ -71,6 +71,40 @@ DUMP = textwrap.dedent(
     """
 )
 
+# The same feed a day later: staging has gained a column, parted has lost one, and
+# oddities has retyped one. Held as its own fixture rather than patched out of DUMP,
+# because string surgery on escaped COPY data is its own source of bugs.
+DRIFTED = textwrap.dedent(
+    """\
+    -- Dumped from database version 17.4
+    -- Dumped by pg_dump version 17.4
+    CREATE TABLE public.staging (
+        id integer,
+        note text,
+        added_col integer
+    );
+    CREATE TABLE public.parted (
+        id integer
+    );
+    CREATE TABLE public.oddities (
+        id text,
+        kind mystery_enum,
+        tags text[],
+        span interval
+    );
+    COPY public.staging (id, note, added_col) FROM stdin;
+    7\tc\\tarol\t1
+    8\tline\\nbreak\t2
+    \\.
+    COPY public.parted (id) FROM stdin;
+    9
+    \\.
+    COPY public.oddities (id, kind, tags, span) FROM stdin;
+    abc\tclick\t{a,b}\t1 day 02:03:04
+    \\.
+    """
+)
+
 EXPECTED_TABLES = {
     "public.Räksmörgås": 2,
     "public.staging": 2,
@@ -114,6 +148,10 @@ def main() -> int:
     for name, rows in EXPECTED_TABLES.items():
         check(by_name[name].rows == rows, f"{name} had {by_name[name].rows} rows, want {rows}")
         check(by_name[name].delta_version >= 1, f"{name} was not committed")
+        check(
+            not any(by_name[name].schema_drift.values()),
+            f"{name} reported drift on a first run: {by_name[name].schema_drift}",
+        )
 
     check(report.compression == "gzip", f"compression was {report.compression}")
     check(report.dumped_by == 17, "pg_dump major not recovered")
@@ -144,7 +182,7 @@ def main() -> int:
     try:
         from deltalake import DeltaTable
     except ImportError:
-        print("deltalake not installed; skipping read-back")
+        print("deltalake not installed; skipping read-back and drift checks")
         print("OK (load only)")
         return 0
 
@@ -167,6 +205,51 @@ def main() -> int:
     oddities = DeltaTable(str(out / "public" / "oddities")).to_pyarrow_table().to_pylist()
     check(oddities[0]["tags"] == "{a,b}", "array should stay a PostgreSQL literal")
     check(oddities[0]["span"] == "1 day 02:03:04", "interval should stay a literal")
+
+    # --- the same feed a day later, with changed DDL ---------------------------------
+    drift_path = tmp / "day2.sql"
+    drift_path.write_text(DRIFTED, encoding="utf-8")
+    second = pgdelta.stream_dump_to_delta(
+        drift_path, uri, mode="overwrite", expect_pg_major=17, threads=2
+    )
+    drifted = {t.table: t for t in second.tables}
+    for name, stats in drifted.items():
+        print(f"   day2 {name}: {stats.schema_drift}")
+
+    check(
+        drifted["public.staging"].schema_drift["added"] == [["added_col"]],
+        f"added column not reported: {drifted['public.staging'].schema_drift}",
+    )
+    check(
+        drifted["public.parted"].schema_drift["removed"] == [["created"]],
+        f"removed column not reported: {drifted['public.parted'].schema_drift}",
+    )
+    retyped = drifted["public.oddities"].schema_drift["retyped"]
+    check(
+        len(retyped) == 1 and retyped[0][0] == "id",
+        f"retyped column not reported: {retyped}",
+    )
+
+    # The declared schema must now match the files, which is the whole point.
+    cols = [f.name for f in DeltaTable(str(out / "public" / "staging")).schema().fields]
+    check(cols == ["id", "note", "added_col"], f"schema did not gain the column: {cols}")
+    cols = [f.name for f in DeltaTable(str(out / "public" / "parted")).schema().fields]
+    check(cols == ["id"], f"schema did not lose the column: {cols}")
+
+    again = DeltaTable(str(out / "public" / "staging")).to_pyarrow_table().to_pylist()
+    check(len(again) == 2, f"drifted table has {len(again)} rows, want 2")
+    check(
+        sorted(r["added_col"] for r in again) == [1, 2],
+        "the new column did not carry its values",
+    )
+
+    # A schema change under append has no defensible meaning and must be refused.
+    try:
+        pgdelta.stream_dump_to_delta(dump_path, uri, mode="append", expect_pg_major=17)
+    except ValueError as exc:
+        print("append refused a changed schema:", str(exc)[:100])
+    else:
+        raise SystemExit("FAIL: append accepted a changed schema")
 
     print("OK")
     return 0

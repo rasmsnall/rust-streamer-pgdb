@@ -53,6 +53,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use deltalake::DeltaTable;
+use deltalake::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use deltalake::kernel::Action;
 use tokio::runtime::Handle;
 
@@ -62,7 +63,7 @@ use crate::copy::{self, Limits};
 use crate::dump::{ChunkReader, decompressed};
 use crate::error::{Error, Result};
 use crate::scan::{Event, Scanner, TableDef, TableName};
-use crate::sink::{TableWriter, WriteMode, commit_table, open_table};
+use crate::sink::{SchemaDrift, TableWriter, WriteMode, commit_table, open_table};
 use crate::types::{self, ResolvedType};
 
 /// Per-worker job queue depth. Bounds how many undecoded chunks can be in flight per
@@ -142,6 +143,9 @@ pub struct Progress {
 pub struct TableStats {
     /// Qualified name as written in the dump.
     pub table: String,
+    /// How this run's schema differed from the one the Delta table already declared.
+    /// Empty on a first run and on any run whose DDL is unchanged.
+    pub schema_drift: SchemaDrift,
     /// Rows decoded from the table's `COPY` block.
     pub rows: u64,
     /// Arrow batches encoded to Parquet for this table, summed across workers.
@@ -197,18 +201,29 @@ fn resolve_copy_columns(def: &TableDef, columns: &[String]) -> Result<Vec<Resolv
         .collect()
 }
 
+/// A table opened in phase one and awaiting its phase-two commit.
+struct CommitTarget {
+    qualified: String,
+    table: DeltaTable,
+    schema: ArrowSchemaRef,
+    drift: SchemaDrift,
+}
+
 /// Reader-side bookkeeping for the `COPY` block currently open.
 struct OpenBlock {
     generation: u64,
     table: TableName,
     qualified: String,
     columns: Vec<(String, ResolvedType)>,
+    drift: SchemaDrift,
 }
 
 /// Immutable description of one open `COPY` block, shared with every worker.
 struct BlockCtx {
     generation: u64,
-    table: DeltaTable,
+    uri: String,
+    schema: ArrowSchemaRef,
+    storage_options: HashMap<String, String>,
     columns: Vec<(String, ResolvedType)>,
     arity: usize,
     limits: Limits,
@@ -483,7 +498,7 @@ where
     let mut tables: Vec<TableStats> = Vec::new();
 
     // Loaded Delta tables and their pooled, uncommitted actions, held until phase two.
-    let mut open_tables: Vec<(String, DeltaTable)> = Vec::new();
+    let mut open_tables: Vec<CommitTarget> = Vec::new();
     let mut staged: HashMap<String, Vec<Action>> = HashMap::new();
 
     let mut generation: u64 = 0;
@@ -540,20 +555,29 @@ where
                     let resolved = resolve_copy_columns(def, &columns)?;
                     let pairs: Vec<(String, ResolvedType)> =
                         columns.iter().cloned().zip(resolved).collect();
-                    let schema = builders::arrow_schema(&pairs);
-                    let delta_table = handle.block_on(open_table(
+                    let schema: ArrowSchemaRef = Arc::new(builders::arrow_schema(&pairs));
+                    let opened = handle.block_on(open_table(
                         &config.output_uri,
                         &table,
                         &schema,
                         config.mode,
                         &config.storage_options,
                     ))?;
-                    open_tables.push((qualified.clone(), delta_table.clone()));
+                    let uri = opened.uri.clone();
+                    let drift = opened.drift.clone();
+                    open_tables.push(CommitTarget {
+                        qualified: qualified.clone(),
+                        table: opened.table,
+                        schema: Arc::clone(&schema),
+                        drift: drift.clone(),
+                    });
 
                     generation += 1;
                     let ctx = Arc::new(BlockCtx {
                         generation,
-                        table: delta_table,
+                        uri,
+                        schema: Arc::clone(&schema),
+                        storage_options: config.storage_options.clone(),
                         columns: pairs.clone(),
                         arity: columns.len(),
                         limits: config.limits,
@@ -568,6 +592,7 @@ where
                         table,
                         qualified,
                         columns: pairs,
+                        drift,
                     });
                     round_robin = 0;
                 }
@@ -605,6 +630,7 @@ where
                         table: name,
                         qualified,
                         columns,
+                        drift,
                     }) = current.take()
                     else {
                         return Err(Error::Internal {
@@ -668,6 +694,7 @@ where
                         .collect();
                     tables.push(TableStats {
                         table: qualified,
+                        schema_drift: drift,
                         rows,
                         batches,
                         delta_version: 0,
@@ -707,17 +734,24 @@ where
     // cross-table transaction. A failure here is reported with how far it got, so an
     // operator can tell "nothing changed" from "the first n tables changed".
     let total = open_tables.len();
-    for (committed, (name, delta_table)) in open_tables.iter_mut().enumerate() {
-        let actions = staged.remove(name).unwrap_or_default();
+    for (committed, target) in open_tables.iter_mut().enumerate() {
+        let actions = staged.remove(&target.qualified).unwrap_or_default();
+        // Declaring the schema is only needed, and only permitted, when it moved.
+        let schema = (!target.drift.is_empty()).then_some(target.schema.as_ref());
         let version = handle
-            .block_on(commit_table(delta_table, actions, config.mode))
+            .block_on(commit_table(
+                &mut target.table,
+                actions,
+                config.mode,
+                schema,
+            ))
             .map_err(|err| Error::CommitFailed {
-                table: name.clone(),
+                table: target.qualified.clone(),
                 committed,
                 total,
                 message: err.to_string(),
             })?;
-        if let Some(stat) = tables.iter_mut().find(|t| &t.table == name) {
+        if let Some(stat) = tables.iter_mut().find(|t| t.table == target.qualified) {
             stat.delta_version = version;
         }
     }
@@ -774,7 +808,11 @@ fn worker_loop(
                     std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                     std::collections::hash_map::Entry::Vacant(e) => e.insert(WorkerBlock {
                         builder: BatchBuilder::new(&ctx.columns, ctx.batch_rows, ctx.batch_bytes),
-                        writer: TableWriter::new(&ctx.table)?,
+                        writer: TableWriter::new(
+                            &ctx.uri,
+                            Arc::clone(&ctx.schema),
+                            &ctx.storage_options,
+                        )?,
                         batches: 0,
                     }),
                 };
