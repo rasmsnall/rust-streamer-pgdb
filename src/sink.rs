@@ -1,4 +1,4 @@
-//! The Delta write path, and the two-phase commit that makes a load all-or-nothing.
+//! The Delta write path, and the two-phase commit that keeps a failed load invisible.
 //!
 //! **This is the only asynchronous module in the crate.** delta-rs exposes an async-only
 //! API, so a Tokio runtime exists, but it is confined to storage operations. Everything

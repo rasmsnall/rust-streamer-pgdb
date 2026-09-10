@@ -135,9 +135,23 @@ progress callback.
 
 The dump is read once, front to back. Every table's Parquet is written and staged during
 that pass, and nothing becomes visible to a Delta reader until the pass completes without
-error, at which point every table is committed. This is the all-or-nothing property
-described in `architecture.md`, Chapter VI, Section 1. Any failure leaves orphaned files
-and no visible change to any table.
+error, at which point every table is committed.
+
+Be precise about what that buys, because the guarantee is narrower than "atomic". Delta
+has no cross-table transaction, and hundreds of tables mean hundreds of independent
+commits, so a group of them cannot be made atomic. What holds is:
+
+- Each table's own commit is atomic.
+- A failure anywhere in the decode pass, which is the multi-hour part and where
+  essentially every failure occurs, leaves **no visible change to any table**.
+- The commit burst at the end is not atomic across tables. A failure partway through it
+  leaves some tables on the new day and some on the previous one, and a reader querying
+  during it can observe a mixture.
+
+The design therefore shrinks the window in which a partial state is observable from the
+whole decode to a metadata-only burst; it does not eliminate it. Recovery is to re-run,
+which is idempotent in `overwrite` mode. See `architecture.md`, Chapter VI, Section 1, and
+`operations.md`, Chapter V.
 
 ### 3. Parameters
 

@@ -16,7 +16,8 @@
 //! # Two-phase load
 //!
 //! Delta has no cross-table transaction, so a dump with hundreds of tables commits
-//! hundreds of times. To keep the load all-or-nothing, [`run`] decodes the **entire**
+//! hundreds of times, and no group of them can be made atomic. To shrink the window in
+//! which a partial state is visible, [`run`] decodes the **entire**
 //! dump and stages every table's Parquet without committing anything (phase one), then
 //! commits every table once the stream has been consumed cleanly (phase two). A failure
 //! in phase one leaves orphaned files and no visible change; see [`crate::sink`] for why
@@ -255,8 +256,13 @@ struct WorkerBlock {
 /// The dump is consumed in a single forward pass on the calling thread. Row decoding and
 /// Parquet encoding run on a pool of [`LoadConfig::threads`] workers. Every table's
 /// Parquet is written and staged during the pass; nothing is committed until the pass
-/// completes without error, at which point every table is committed. A failure at any
-/// point leaves orphaned files and no visible change to any table.
+/// completes without error, at which point every table is committed.
+///
+/// A failure during the pass leaves orphaned files and no visible change to any table.
+/// The commit burst that follows is **not** atomic across tables: Delta has no cross-table
+/// transaction, so a failure partway through it leaves some tables on the new contents and
+/// some on the old. Re-running is the recovery, and is idempotent under
+/// [`WriteMode::Overwrite`].
 ///
 /// `progress` is called after every chunk and after every `COPY` block; returning `false`
 /// aborts the load with [`Error::Interrupted`]. Pass `|_| true` to ignore it. It is the

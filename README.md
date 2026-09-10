@@ -17,9 +17,15 @@ dump file -> decode -> Arrow -> Delta
   48 GB one; only wall-clock time scales.
 - **Parallelises.** The reader and scanner stay sequential because DDL must be read in
   order, but row decoding and Parquet encoding fan out across a worker pool.
-- **Loads all or nothing.** Every table's Parquet is staged with nothing committed; only
-  once the whole dump has been consumed cleanly is every table committed. A failure leaves
-  orphaned files and no visible change, never a partial day.
+- **Stages everything before committing anything.** Every table's Parquet is written with
+  nothing committed; only once the whole dump has been consumed cleanly is any table
+  committed. A failure during that pass, which is where essentially all failures occur,
+  leaves orphaned files and no visible change at all.
+  This is not cross-table atomicity, which Delta cannot provide: the final commit burst is
+  hundreds of independent per-table commits, and a failure partway through it leaves some
+  tables on the new day and some on the old. What the design buys is shrinking that window
+  from the multi-hour decode to a metadata-only burst at the end. See
+  [`docs/architecture.md`](docs/architecture.md), Chapter VI.
 - **Fails loudly on structure, degrades quietly on types.** A truncated `COPY` block or a
   row whose field count disagrees with its header fails the load. An unrecognised
   PostgreSQL type becomes text and is reported in the returned statistics.

@@ -129,8 +129,14 @@ fn parse_mode(mode: &str) -> PyResult<WriteMode> {
 ///
 /// The dump is read once, front to back. Every table's Parquet is written and staged
 /// during the pass; nothing becomes visible to a Delta reader until the pass completes
-/// without error, at which point every table is committed. Any failure leaves orphaned
-/// files and no visible change, so a failed run never produces a partial day.
+/// without error, at which point every table is committed. A failure during that pass,
+/// which is where essentially every failure occurs, leaves orphaned files and no visible
+/// change to any table.
+///
+/// That is not cross-table atomicity, which Delta cannot provide: the commit at the end is
+/// one independent commit per table, so a failure partway through it leaves some tables on
+/// the new day and some on the old, and a reader during it can see a mixture. Re-run to
+/// recover; ``overwrite`` is idempotent.
 ///
 /// Parameters
 /// ----------

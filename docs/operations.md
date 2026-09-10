@@ -283,8 +283,9 @@ in `architecture.md`, Chapter VI, Section 1.
 
 ### 2. Re-running a failed load
 
-**Simply run it again.** In `overwrite` mode the load is idempotent: a re-run replaces
-whatever the previous attempt left, and the previous attempt committed nothing.
+**Simply run it again.** In `overwrite` mode the load is idempotent: a re-run rewrites
+every table from the dump, replacing whatever the previous attempt left, whether that was
+nothing at all or a partially committed set.
 
 There is no cleanup step and no state to reset. The orphaned files from the failed attempt
 are collected by the next `VACUUM`.
