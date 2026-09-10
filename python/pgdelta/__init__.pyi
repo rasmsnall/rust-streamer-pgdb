@@ -162,7 +162,12 @@ def stream_dump_to_delta(
     Parameters
     ----------
     dump_path:
-        Path to the plain-text dump. gzip is decompressed transparently.
+        Where the dump is. A local path, a ``file://`` URL, or an object in cloud storage:
+        ``abfss://`` and ``az://`` with the ``azure`` feature, ``gs://`` with ``gcp``,
+        ``s3://`` with ``s3``. A remote object is read directly, with no staging copy on
+        local disk, and a byte stream that breaks part way is resumed with a ranged request
+        rather than failing the load. gzip is decompressed transparently either way.
+        ``storage_options`` supplies the credentials.
     output_uri:
         Prefix the tables are written beneath, for example ``/Volumes/main/raw/pg/`` or an
         ``abfss://`` URL. Each table's sub-path comes from its qualified name and is

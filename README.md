@@ -13,8 +13,10 @@ dump file -> decode -> Arrow -> Delta
 
 ## What it does
 
-- **Streams.** Memory is O(1) in dump size. A 480 GB dump costs the same footprint as a
-  48 GB one; only wall-clock time scales.
+- **Streams, from wherever the dump is.** A local path, or an object read straight out of
+  `abfss://`, `gs://` or `s3://` with no staging copy on local disk. Memory is O(1) in dump
+  size: a 480 GB dump costs the same footprint as a 48 GB one, and only wall-clock time
+  scales. A byte stream that breaks part way is resumed with a ranged request.
 - **Parallelises.** The reader and scanner stay sequential because DDL must be read in
   order, but row decoding and Parquet encoding fan out across a worker pool.
 - **Stages everything before committing anything.** Every table's Parquet is written with

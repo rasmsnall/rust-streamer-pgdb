@@ -33,10 +33,15 @@ flate2 = "1.1.10"
 # against the arrow release delta-rs pins.
 deltalake = "0.32.4"
 
-# Already compiled as part of the deltalake tree; declared so sink.rs can name them.
+# Already compiled as part of the deltalake tree; declared so the crate can name them.
 # Pinned to the versions deltalake already resolves, so no duplicate copy is built.
 tokio = { version = "1.53.1", features = ["rt", "rt-multi-thread"] }
 futures = "0.3.34"
+# Reading the dump straight out of cloud storage. The cloud backends are switched on by
+# deltalake's features rather than here, so the two cannot select different ones.
+object_store = "0.13.2"
+bytes = "1.12.1"
+url = "2.5"
 
 [features]
 default = []
@@ -45,8 +50,11 @@ default = []
 extension-module = ["pyo3/extension-module"]
 # Faster gzip via zlib-ng. Requires a C toolchain and cmake at build time.
 fast-gzip = ["flate2/zlib-ng"]
-# Azure object store, for abfss:// output. Not needed for /Volumes FUSE paths.
+# Cloud object stores, for reading a dump from, or writing tables to, that backend.
+# Not needed for a local path or a /Volumes FUSE path.
 azure = ["deltalake/azure"]
+gcp = ["deltalake/gcs"]
+s3 = ["deltalake/s3"]
 
 [profile.release]
 opt-level = 3

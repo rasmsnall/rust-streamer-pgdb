@@ -382,6 +382,79 @@ where
     R: std::io::Read + 'static,
     F: FnMut(Progress) -> bool,
 {
+    execute(
+        |_| Ok(Box::new(input) as Box<dyn std::io::Read>),
+        config,
+        progress,
+    )
+}
+
+/// Streams the dump at `uri` into Delta tables.
+///
+/// `uri` may be a local path, a `file://` URL, or an object in cloud storage: `abfss://`
+/// and `az://` with the `azure` feature, `gs://` with `gcp`, `s3://` with `s3`. A remote
+/// object is read directly, with no staging copy on local disk, and a byte stream that
+/// breaks part way is resumed with a ranged request rather than failing the load.
+///
+/// `config.storage_options` supplies credentials and endpoint settings to the store. The
+/// same map is used for the output location, so a load that reads and writes the same
+/// account needs it only once.
+///
+/// # Errors
+///
+/// [`Error::Io`] if the location cannot be parsed or opened, if the transfer ends short of
+/// the object's stated length, or if the stream breaks more times than it can be resumed.
+/// Otherwise every error [`run`] can return.
+///
+/// # Panics
+///
+/// Does not panic.
+///
+/// # Blocking
+///
+/// Blocks until the load finishes; see [`run`].
+///
+/// # Examples
+///
+/// ```no_run
+/// use pgdelta::pipeline::{LoadConfig, run_uri};
+///
+/// let config = LoadConfig {
+///     output_uri: "abfss://data@account.dfs.core.windows.net/bronze/pg/".into(),
+///     expect_pg_major: Some(17),
+///     ..LoadConfig::default()
+/// };
+/// let report = run_uri(
+///     "abfss://landing@account.dfs.core.windows.net/pg/day.sql.gz",
+///     &config,
+///     |_| true,
+/// )?;
+/// # let _ = report;
+/// # Ok::<(), pgdelta::Error>(())
+/// ```
+pub fn run_uri<F>(uri: &str, config: &LoadConfig, progress: F) -> Result<LoadReport>
+where
+    F: FnMut(Progress) -> bool,
+{
+    execute(
+        |handle| {
+            let (reader, _size) = crate::source::open(uri, &config.storage_options, handle)?;
+            Ok(reader)
+        },
+        config,
+        progress,
+    )
+}
+
+/// Builds the runtime and the pool, then drives the load.
+///
+/// `open` is handed the runtime handle, because a source in cloud storage is async and
+/// cannot be resolved before the runtime it will be driven on exists.
+fn execute<O, F>(open: O, config: &LoadConfig, progress: F) -> Result<LoadReport>
+where
+    O: FnOnce(&Handle) -> Result<Box<dyn std::io::Read>>,
+    F: FnMut(Progress) -> bool,
+{
     // Checked before anything is opened or spawned, so an unusable target fails in a
     // second rather than after the dump has been decoded.
     reject_managed_storage(&config.output_uri)?;
@@ -416,9 +489,14 @@ where
     }
     drop(event_tx);
 
-    let outcome = drive(
-        input, config, progress, &handle, &job_tx, &event_rx, threads,
-    );
+    // Opened here rather than by the caller, so that a remote source can use the runtime
+    // and so that a failure to open still tears the pool down cleanly.
+    let outcome = match open(&handle) {
+        Ok(input) => drive(
+            input, config, progress, &handle, &job_tx, &event_rx, threads,
+        ),
+        Err(err) => Err(err),
+    };
 
     // Shut the pool down and reap it, whatever the outcome. Dropping every job sender
     // ends each worker's `recv`; the event channel has room for a final event from each.
@@ -506,8 +584,8 @@ fn dispatch(
 
 /// The reader: scans the dump on the calling thread, drives the pool, then commits.
 #[allow(clippy::too_many_arguments)]
-fn drive<R, F>(
-    input: R,
+fn drive<F>(
+    input: Box<dyn std::io::Read>,
     config: &LoadConfig,
     mut progress: F,
     handle: &Handle,
@@ -516,7 +594,6 @@ fn drive<R, F>(
     threads: usize,
 ) -> Result<LoadReport>
 where
-    R: std::io::Read + 'static,
     F: FnMut(Progress) -> bool,
 {
     // Count on the way in, before decompression, so the figure reported to the caller can

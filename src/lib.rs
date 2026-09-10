@@ -33,6 +33,7 @@ pub mod error;
 pub mod pipeline;
 pub mod scan;
 pub mod sink;
+pub mod source;
 pub mod types;
 pub mod values;
 

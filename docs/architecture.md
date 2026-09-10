@@ -202,8 +202,22 @@ Opens a file or file descriptor and produces byte chunks. Deliberately synchrono
 (`std::io::Read`), because the input is a local file or FUSE-mounted path read
 sequentially at line rate. Asynchrony would add complexity and provide no benefit.
 
+The source is either a local path or an object in cloud storage. Reading the object
+directly matters more than it sounds: without it the dump has to reach local disk first,
+which for a feed landing in cloud storage means a staging chain of
+`object storage -> Python memory -> another store -> local file -> this library`, each
+step costing its own copy of a 48 GB file and its own failure mode.
+
+The object-store API is async, so a remote source is driven by blocking on the load's
+runtime one chunk at a time; everything downstream still sees a plain `Read`. A multi-hour
+download over a connection that drops is expected rather than exceptional, so a broken
+stream is resumed with a ranged GET from the offset already delivered. A stream that ends
+short of the object's stated length fails the load, because a short read here would look
+exactly like a truncated dump and be blamed on the sender.
+
 Because the source is a delivered file rather than a spawned process, this module
-contains no subprocess handling, no credentials, and no connection strings.
+contains no subprocess handling and no connection strings. Credentials, when a cloud
+source needs them, arrive in `storage_options` and are never logged.
 
 Compression is detected from the stream's leading magic bytes rather than from
 configuration or a file extension, so a change of format by the sender is handled rather
