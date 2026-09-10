@@ -168,6 +168,7 @@ which is idempotent in `overwrite` mode. See `architecture.md`, Chapter VI, Sect
 | `batch_rows` | `int` | `100_000` | Row ceiling for one in-memory Arrow batch |
 | `batch_bytes` | `int` | `128 << 20` | Byte ceiling for one in-memory Arrow batch, on decoded field bytes |
 | `threads` | `int` or `None` | `None` | Decode and Parquet-encode workers. `None` uses the machine's parallelism |
+| `commit_concurrency` | `int` or `None` | `None` | Commits attempted at once in the final burst. `None` uses 16 |
 | `storage_options` | `dict[str, str]` or `None` | `None` | Backend options passed through to `object_store` |
 | `expect_pg_major` | `int` or `None` | `None` | When set, the load fails unless the dump's `pg_dump` major matches exactly |
 | `expect_tables` | `list[str]` or `None` | `None` | Names this dump is expected to contain. Reports only; see Chapter III, Section 4 |
@@ -178,6 +179,12 @@ which is idempotent in `overwrite` mode. See `architecture.md`, Chapter VI, Sect
 
 Every parameter after `output_uri` is keyword-only, so a positional argument cannot drift
 onto the wrong slot as the signature grows.
+
+`threads` and `commit_concurrency` measure different things and should not be set to
+the same number by reflex. `threads` is CPU work: decoding and Parquet encoding, bounded
+by cores. `commit_concurrency` is a small metadata write waiting on a storage round trip,
+bounded by latency, so a value well above the core count is correct. With hundreds of
+small tables the second is what decides whether the final burst takes seconds or minutes.
 
 Two of these interact and are worth stating together: **`threads` and `batch_bytes`
 multiply.** Peak memory is roughly `threads * batch_bytes` plus a Parquet write buffer per

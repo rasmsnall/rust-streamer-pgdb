@@ -371,6 +371,18 @@ The practical bottleneck order is decompression first, since it is serial and ca
 parallelised at all, then Parquet encoding, then object-store upload, with row decoding a
 distant last. See Chapter III, Section 2.
 
+Phase two is concurrent as well, at [`LoadConfig::commit_concurrency`] commits at once.
+That is a separate dimension from the decode pool: a commit is a metadata write waiting on
+a storage round trip, not CPU work, so it is sized by latency rather than by cores. With
+hundreds of small tables, committing serially turns the burst into a queue of round trips,
+which is the tail described in Chapter I.
+
+Concurrency does not weaken the failure model, and it changes one detail of the report.
+The commit that fails need not be the last one attempted, so the count carried by
+`CommitFailed` is how many succeeded rather than how far a loop had progressed. That is
+the more useful number in either case, since it is what says whether anything became
+visible.
+
 Row order is not preserved across chunks. Delta tables are unordered sets, so this is
 correct. A chunk index may be carried if determinism is ever required.
 

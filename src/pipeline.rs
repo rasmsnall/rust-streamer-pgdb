@@ -55,6 +55,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use deltalake::DeltaTable;
 use deltalake::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use deltalake::kernel::Action;
+use futures::StreamExt;
 use tokio::runtime::Handle;
 
 use crate::builders::{self, BatchBuilder};
@@ -71,6 +72,13 @@ use crate::types::{self, ResolvedType};
 /// Per-worker job queue depth. Bounds how many undecoded chunks can be in flight per
 /// worker, and with the chunk size sets the decode queue's memory.
 const QUEUE_DEPTH: usize = 3;
+
+/// Commits attempted at once in phase two when the caller does not choose.
+///
+/// A commit is a small metadata write, so this is bounded by storage round-trip latency
+/// rather than by cores, and a number well above the core count is correct. Hundreds of
+/// tables committed one at a time is the tail this exists to remove.
+const DEFAULT_COMMIT_CONCURRENCY: usize = 16;
 
 /// Settings for one load.
 ///
@@ -95,6 +103,13 @@ pub struct LoadConfig {
     pub batch_bytes: usize,
     /// Decode workers to run. `0` picks [`std::thread::available_parallelism`].
     pub threads: usize,
+    /// Commits attempted at once in phase two. `0` picks a default of 16.
+    ///
+    /// Separate from [`LoadConfig::threads`] because it measures a different thing. A
+    /// commit is a small metadata write waiting on a storage round trip, not CPU work, so
+    /// the useful value is well above the core count. With hundreds of small tables this
+    /// is what decides whether the commit burst takes seconds or minutes.
+    pub commit_concurrency: usize,
     /// Backend-specific options passed to `object_store`, for example credentials for an
     /// `abfss://` target.
     pub storage_options: HashMap<String, String>,
@@ -125,6 +140,7 @@ impl Default for LoadConfig {
             batch_rows: 100_000,
             batch_bytes: 128 << 20,
             threads: 0,
+            commit_concurrency: 0,
             storage_options: HashMap::new(),
             expect_pg_major: None,
             expect_tables: None,
@@ -231,6 +247,9 @@ struct CommitTarget {
     table: DeltaTable,
     schema: ArrowSchemaRef,
     drift: SchemaDrift,
+    /// Staged `Add` actions, moved in before phase two so each commit owns its own data
+    /// and the commits can run concurrently without sharing a map.
+    actions: Vec<Action>,
 }
 
 /// Reader-side bookkeeping for the `COPY` block currently open.
@@ -602,6 +621,7 @@ where
                         table: opened.table,
                         schema: Arc::clone(&schema),
                         drift: drift.clone(),
+                        actions: Vec::new(),
                     });
 
                     generation += 1;
@@ -766,26 +786,54 @@ where
     // cross-table transaction. A failure here is reported with how far it got, so an
     // operator can tell "nothing changed" from "the first n tables changed".
     let total = open_tables.len();
-    for (committed, target) in open_tables.iter_mut().enumerate() {
-        let actions = staged.remove(&target.qualified).unwrap_or_default();
-        // Declaring the schema is only needed, and only permitted, when it moved.
-        let schema = (!target.drift.is_empty()).then_some(target.schema.as_ref());
-        let version = handle
-            .block_on(commit_table(
-                &mut target.table,
-                actions,
-                config.mode,
-                schema,
-            ))
-            .map_err(|err| Error::CommitFailed {
-                table: target.qualified.clone(),
-                committed,
-                total,
-                message: err.to_string(),
-            })?;
-        if let Some(stat) = tables.iter_mut().find(|t| t.table == target.qualified) {
-            stat.delta_version = version;
+    for target in &mut open_tables {
+        target.actions = staged.remove(&target.qualified).unwrap_or_default();
+    }
+
+    let concurrency = match config.commit_concurrency {
+        0 => DEFAULT_COMMIT_CONCURRENCY,
+        n => n,
+    };
+    let mode = config.mode;
+    let outcomes: Vec<(String, Result<u64>)> = handle.block_on(async {
+        futures::stream::iter(open_tables.into_iter().map(|mut target| async move {
+            // Declaring the schema is only needed, and only permitted, when it moved.
+            let schema = (!target.drift.is_empty()).then(|| Arc::clone(&target.schema));
+            let actions = std::mem::take(&mut target.actions);
+            let outcome = commit_table(&mut target.table, actions, mode, schema.as_deref()).await;
+            (target.qualified, outcome)
+        }))
+        .buffer_unordered(concurrency)
+        .collect()
+        .await
+    });
+
+    // Concurrency means the failure need not be the last one attempted, so count what
+    // actually succeeded rather than how far a loop had got.
+    let mut committed = 0usize;
+    let mut failure: Option<(String, Error)> = None;
+    for (name, outcome) in outcomes {
+        match outcome {
+            Ok(version) => {
+                committed += 1;
+                if let Some(stat) = tables.iter_mut().find(|t| t.table == name) {
+                    stat.delta_version = version;
+                }
+            }
+            Err(err) => {
+                if failure.is_none() {
+                    failure = Some((name, err));
+                }
+            }
         }
+    }
+    if let Some((table, err)) = failure {
+        return Err(Error::CommitFailed {
+            table,
+            committed,
+            total,
+            message: err.to_string(),
+        });
     }
 
     // The expectation is expect_tables when given, otherwise the filter, so that a name

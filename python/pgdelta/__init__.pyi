@@ -137,6 +137,7 @@ def stream_dump_to_delta(
     batch_rows: int = ...,
     batch_bytes: int = ...,
     threads: int | None = ...,
+    commit_concurrency: int | None = ...,
     storage_options: Mapping[str, str] | None = ...,
     expect_pg_major: int | None = ...,
     expect_tables: Sequence[str] | None = ...,
@@ -178,6 +179,11 @@ def stream_dump_to_delta(
         file size. Peak memory is roughly ``threads * batch_bytes``.
     threads:
         Decode and Parquet-encode workers. ``None`` uses the machine's parallelism.
+    commit_concurrency:
+        Commits attempted at once at the end of the load. ``None`` uses 16. A commit is a
+        small metadata write waiting on a storage round trip rather than CPU work, so the
+        useful value is well above the core count. With hundreds of small tables this
+        decides whether the final burst takes seconds or minutes.
     storage_options:
         Backend options passed through to ``object_store``.
     expect_pg_major:

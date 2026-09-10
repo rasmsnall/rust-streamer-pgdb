@@ -15,11 +15,18 @@ and the drift check are skipped.
 from __future__ import annotations
 
 import gzip
+import sys
 import tempfile
 import textwrap
 from pathlib import Path
 
 import pgdelta
+
+# Table names here are deliberately non-ASCII. Under a C locale, printing them would raise
+# UnicodeEncodeError and fail CI for a reason that has nothing to do with the library.
+for stream in (sys.stdout, sys.stderr):
+    if hasattr(stream, "reconfigure"):
+        stream.reconfigure(encoding="utf-8", errors="replace")
 
 # Every construct here has broken this library at least once, or is the reason a guard
 # exists. Keep additions in that spirit rather than adding volume.

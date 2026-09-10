@@ -50,6 +50,7 @@
 - `<Table 2-1>` Output location options
 - `<Table 3-1>` Measured stage throughput
 - `<Table 3-2>` Indicative runtimes
+- `<Table 3-3>` Commit burst against a local filesystem, 200 small tables
 - `<Table 5-1>` Exception to first action
 - `<Table 6-1>` Values worth recording per run
 - `<Table B-1>` Known gaps
@@ -191,6 +192,34 @@ other work, or when memory is constrained and lowering `batch_bytes` was not eno
 
 Raising it above the core count achieves nothing: the workers are CPU-bound on decoding
 and Parquet encoding, not waiting on anything.
+
+`commit_concurrency` is the opposite case and defaults to 16. A commit is a small metadata
+write waiting on a storage round trip, so it is bounded by latency rather than by cores,
+and a number well above the core count is correct. This is the knob for the long tail: the
+feed has around 450 tables, most of them small, and committing them one at a time turns a
+metadata burst into a serial queue of round trips.
+
+`<Table 3-3>` Commit burst against a local filesystem, 200 small tables
+
+| `commit_concurrency` | Total run |
+|---|---|
+| 1 | 3.89 s |
+| 4 | 2.56 s |
+| 16 | 2.24 s |
+| 64 | 2.47 s |
+
+Read that as a floor, not as the expected benefit. A local filesystem has almost none of
+the round-trip latency the concurrency exists to hide, and it still returns 1.7x between
+serial and the default. Against `abfss://`, where a round trip is tens of milliseconds
+rather than microseconds, the gap is wider.
+
+The measurement also shows why the default is 16 rather than something larger: 64 is
+slower than 16 here, because past a point the requests queue anyway and the coordination
+is pure cost.
+
+Raise it if the commit burst is a visible fraction of the run against `abfss://`. There is
+little reason to lower it below the default except to reduce request pressure on a shared
+storage account.
 
 ### 4. Expected runtime
 

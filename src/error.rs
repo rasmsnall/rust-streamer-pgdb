@@ -308,7 +308,7 @@ impl fmt::Display for Error {
                 } else {
                     write!(
                         f,
-                        "commit failed on table {table} after {committed} of {total} \
+                        "commit failed on table {table}; {committed} of {total} \
                          tables were committed, so those {committed} now hold the new \
                          contents and the rest hold the previous run's; re-run to restore \
                          consistency: {message}"
