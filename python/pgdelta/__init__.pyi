@@ -149,6 +149,7 @@ def stream_dump_to_delta(
     tables: Sequence[str] | None = ...,
     excluded_schemas: Sequence[str] | None = ...,
     wide_numeric_as_decimal: bool = ...,
+    native_arrays: bool = ...,
     mode: Literal["overwrite", "append", "error"] = ...,
     batch_rows: int = ...,
     batch_bytes: int = ...,
@@ -208,6 +209,14 @@ def stream_dump_to_delta(
         contradicts its declared shape. A ``numeric(p,s)`` with ``p <= 38`` and a scale
         Arrow cannot represent (negative, or exceeding ``p``) is unaffected and keeps
         falling back to text regardless. ``False`` by default.
+    native_arrays:
+        Map a one-dimensional array whose element type this library can represent to a
+        native Arrow list, instead of the default text fallback that keeps the array as
+        PostgreSQL's own ``{...}`` literal. The element type is subject to
+        ``wide_numeric_as_decimal`` exactly as a plain column of that type would be; an
+        unrecognised element type leaves the whole array column as text. A declaration
+        with more than one dimension, such as ``integer[][]``, is unaffected by this flag
+        and keeps falling back to text. ``False`` by default.
     mode:
         ``"overwrite"`` tombstones the previous run's files in the same commit that adds
         the new ones. ``"append"`` adds to what is there. ``"error"`` fails if the target

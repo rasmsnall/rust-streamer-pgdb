@@ -612,12 +612,16 @@ than if.
 | `timestamptz` | `Timestamp(Micros, UTC)` |
 | `time` | `Time64(Micros)` |
 | `bytea` | `Binary` |
-| `text`, `varchar`, `char`, `uuid`, `json`, `jsonb`, `inet`, enums, arrays, `interval` | `Utf8` |
+| `text`, `varchar`, `char`, `uuid`, `json`, `jsonb`, `inet`, `interval` | `Utf8` |
+| A one-dimensional array of a supported element type | `Utf8`, or `List(element)` opted into with `native_arrays` |
+| A multi-dimensional array, or an array of an unsupported element type | `Utf8`, always |
 | Anything unrecognised | `Utf8`, reported in statistics |
 
-Arrays and `interval` are retained as their unescaped PostgreSQL literal. This is honest:
-it avoids guessing at a structure the caller may not want, and the text remains
-convertible downstream.
+`interval` is retained as its unescaped PostgreSQL literal always. This is honest: it
+avoids guessing at a structure the caller may not want, and the text remains convertible
+downstream. An array is retained as PostgreSQL's own `{...}` literal by default for the
+same reason, but `native_arrays` opts a one-dimensional array of a supported element type
+into a native Arrow `List` instead. See Section 2.
 
 `timestamp` is stamped with the `UTC` timezone in its Arrow type regardless of whether
 the source carried one. An Arrow `Timestamp` with *no* timezone at all is delta-rs's own
@@ -674,6 +678,48 @@ digits), so the check happens in `values::parse_decimal` before the value ever r
 builder. The negative-or-over-precision scale case above is unaffected by this flag: it
 stays text, because reinterpreting its declared scale as 18 would change what the column
 means without saying so.
+
+`LoadConfig::native_arrays` does the equivalent for a one-dimensional array whose element
+type has a concrete Arrow mapping, moving it from text into a native `List(element)`. It
+is decided once, the same way and for the same reason as `wide_numeric_as_decimal`: per
+value would risk a batch whose arrays disagree with their own schema. Two independent
+things gate a native `List`:
+
+- **Dimension.** `strip_array_suffix` (in `types.rs`) counts every `[]`/`[N]` suffix a
+  declaration carries, for example `2` for `integer[][]`. Only a count of exactly `1`
+  qualifies. PostgreSQL's own multi-dimensional arrays are rectangular in a way a
+  one-dimensional `array_out` literal parser does not need to enforce, and pg_dump's own
+  array syntax nests one brace pair per dimension, which this library does not parse; a
+  higher count keeps degrading to text.
+- **Element support.** The element type must resolve to something other than an
+  unrecognised type or a `numeric` that does not fit (with `wide_numeric_as_decimal`
+  applied to it exactly as it would a plain column of that type). `array_element_type`
+  makes this one function the single source of truth for "is this array eligible",
+  shared by both the schema (`arrow_type`) and the value builder (`ColumnBuilder::new`),
+  so the two cannot disagree about a column's Arrow type, the same discipline `arrow_type`
+  and `ColumnBuilder::new`'s own doc comments already require of the rest of the type
+  system.
+
+Reading one array value is a second, independent layer of escaping on top of `COPY`'s
+own. By the time a field reaches `values::parse_array_elements`, `COPY`'s own escaping
+has already been resolved; what is left is PostgreSQL's `array_out` literal syntax,
+`{elem1,elem2,...}`, with its own quoting rules: an element is quoted if it is empty,
+contains a brace, the delimiter (`,`), a double quote, a backslash, whitespace, or is
+exactly the word `NULL`, and inside a quoted element only `"` and `\` themselves are
+backslash-escaped. An unquoted, bare `NULL` token is a null element; a quoted `"NULL"` is
+the literal four-character string, which is exactly why `array_out` quotes it. Each
+element, once unescaped, is handed to the same parser and validator its own scalar column
+would use (`values::parse_i32`, `values::parse_decimal`, and so on), so an array element
+is held to precisely the same fidelity rules as a plain column of that type: `infinity`
+and `NaN` degrade to a null element and are counted, and a value that contradicts its
+element type fails the load.
+
+A native array's own nullability and its elements' nullability are independent: the
+`COPY` field itself can be `\N` (the array is null), and independently, within a
+non-null array, individual elements can be the `NULL` token. `ColumnBuilder::List`
+tracks the two separately, an `offsets` buffer identifying which flattened element
+range each row owns and a `validity` bit for the row itself, mirroring how Arrow's
+`ListArray` represents both.
 
 ### 3. Schema changes between runs
 

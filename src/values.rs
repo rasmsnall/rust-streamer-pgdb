@@ -211,6 +211,87 @@ pub fn parse_decimal(v: &[u8], precision: u8, scale: i8, column: &str) -> Result
     Ok(Some(if negative { -unscaled } else { unscaled }))
 }
 
+/// Splits a one-dimensional PostgreSQL array literal, `{...}`, into its elements.
+///
+/// Each element is `None` for the bare, unquoted `NULL` token `array_out` writes for a
+/// null element, or `Some` of its bytes otherwise, with the quoting and backslash
+/// escaping `array_out` applies resolved. This is a second layer of escaping, independent
+/// of `COPY`'s own: the field this function is given has already had `COPY`'s escaping
+/// resolved, and what is left is the array literal syntax itself. Quoting rules mirror
+/// `array_out`: an element is quoted if it is empty, contains a brace, the delimiter
+/// (`,`), a double quote, a backslash, whitespace, or is exactly the word `NULL`, and
+/// within a quoted element only `"` and `\` themselves are backslash-escaped.
+///
+/// # Errors
+///
+/// [`Error::UnparsableValue`] if the text is not a well-formed one-dimensional array
+/// literal: missing enclosing braces, an unterminated quoted element, or a stray
+/// character where a comma or the closing brace was expected.
+pub fn parse_array_elements(v: &[u8], column: &str) -> Result<Vec<Option<Vec<u8>>>> {
+    if v.first() != Some(&b'{') || v.last() != Some(&b'}') || v.len() < 2 {
+        return Err(bad(column, "array"));
+    }
+    let inner = &v[1..v.len() - 1];
+    let mut elements = Vec::new();
+    let mut i = 0usize;
+    if inner.is_empty() {
+        return Ok(elements);
+    }
+    loop {
+        while i < inner.len() && inner[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if inner.get(i) == Some(&b'"') {
+            let mut buf = Vec::new();
+            i += 1;
+            loop {
+                match inner.get(i) {
+                    None => return Err(bad(column, "array")),
+                    Some(b'"') => {
+                        i += 1;
+                        break;
+                    }
+                    Some(b'\\') => {
+                        let Some(&escaped) = inner.get(i + 1) else {
+                            return Err(bad(column, "array"));
+                        };
+                        buf.push(escaped);
+                        i += 2;
+                    }
+                    Some(&c) => {
+                        buf.push(c);
+                        i += 1;
+                    }
+                }
+            }
+            elements.push(Some(buf));
+        } else {
+            let start = i;
+            while inner
+                .get(i)
+                .is_some_and(|&c| c != b',' && c != b'}' && !c.is_ascii_whitespace())
+            {
+                i += 1;
+            }
+            let raw = &inner[start..i];
+            elements.push(if raw == b"NULL" {
+                None
+            } else {
+                Some(raw.to_vec())
+            });
+        }
+        while i < inner.len() && inner[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        match inner.get(i) {
+            None => break,
+            Some(b',') => i += 1,
+            Some(_) => return Err(bad(column, "array")),
+        }
+    }
+    Ok(elements)
+}
+
 /// Days from the Unix epoch for a proleptic Gregorian date.
 ///
 /// Howard Hinnant's algorithm, implemented directly rather than pulling in a calendar
@@ -536,6 +617,83 @@ mod tests {
         // The boundary at precision 38 (decimal(38,18)'s widest representable value).
         assert!(parse_decimal(b"99999999999999999999.999999999999999999", 38, 18, C).is_ok());
         assert!(parse_decimal(b"100000000000000000000.000000000000000000", 38, 18, C).is_err());
+    }
+
+    #[test]
+    fn array_elements_split_on_top_level_commas() {
+        assert_eq!(
+            parse_array_elements(b"{1,2,3}", C).unwrap(),
+            vec![
+                Some(b"1".to_vec()),
+                Some(b"2".to_vec()),
+                Some(b"3".to_vec())
+            ]
+        );
+        assert_eq!(parse_array_elements(b"{}", C).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn array_elements_unquoted_null_token_is_a_null_element() {
+        assert_eq!(
+            parse_array_elements(b"{1,NULL,3}", C).unwrap(),
+            vec![Some(b"1".to_vec()), None, Some(b"3".to_vec())]
+        );
+    }
+
+    /// `array_out` quotes an element whose actual text is the word NULL, precisely so it
+    /// stays distinguishable from a real null. A quoted "NULL" must not be treated as one.
+    #[test]
+    fn array_elements_a_quoted_null_word_is_the_literal_string() {
+        assert_eq!(
+            parse_array_elements(br#"{"NULL"}"#, C).unwrap(),
+            vec![Some(b"NULL".to_vec())]
+        );
+    }
+
+    #[test]
+    fn array_elements_quoted_commas_and_braces_survive() {
+        assert_eq!(
+            parse_array_elements(br#"{hello,"wor,ld","has{brace}"}"#, C).unwrap(),
+            vec![
+                Some(b"hello".to_vec()),
+                Some(b"wor,ld".to_vec()),
+                Some(b"has{brace}".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn array_elements_backslash_escapes_are_resolved() {
+        // array_out backslash-escapes only `"` and `\` themselves.
+        assert_eq!(
+            parse_array_elements(br#"{"has \"quotes\"","back\\slash"}"#, C).unwrap(),
+            vec![
+                Some(br#"has "quotes""#.to_vec()),
+                Some(br"back\slash".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn array_elements_quoted_empty_string_is_not_null() {
+        assert_eq!(
+            parse_array_elements(br#"{"",a}"#, C).unwrap(),
+            vec![Some(Vec::new()), Some(b"a".to_vec())]
+        );
+    }
+
+    #[test]
+    fn array_elements_malformed_literals_are_rejected() {
+        assert!(parse_array_elements(b"1,2,3", C).is_err(), "no braces");
+        assert!(parse_array_elements(b"{1,2,3", C).is_err(), "unterminated");
+        assert!(
+            parse_array_elements(br#"{"unterminated}"#, C).is_err(),
+            "unterminated quote"
+        );
+        assert!(
+            parse_array_elements(b"{1 2,3}", C).is_err(),
+            "stray character where a comma or brace was expected"
+        );
     }
 
     #[test]

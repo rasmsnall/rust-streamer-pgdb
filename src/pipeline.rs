@@ -128,6 +128,23 @@ pub struct LoadConfig {
     ///
     /// `false` by default, so an existing caller sees no change until it opts in.
     pub wide_numeric_as_decimal: bool,
+    /// Map a one-dimensional array whose element type this library can represent to a
+    /// native Arrow `List`, instead of the default text fallback that keeps the array as
+    /// PostgreSQL's own `{...}` literal.
+    ///
+    /// The element type must itself have a concrete mapping: a `numeric[]` element is
+    /// subject to [`LoadConfig::wide_numeric_as_decimal`] exactly as a plain `numeric`
+    /// column would be, and an unrecognised element type (an enum, domain, or composite)
+    /// leaves the whole array column as text, decided once when the column's type is
+    /// resolved, the same as [`LoadConfig::wide_numeric_as_decimal`] decides a `numeric`
+    /// column's mapping once rather than per value.
+    ///
+    /// A declaration with more than one dimension, such as `integer[][]`, is unaffected
+    /// by this flag and keeps falling back to text: PostgreSQL's multi-dimensional arrays
+    /// are rectangular in a way this library's array-literal reader does not parse.
+    ///
+    /// `false` by default, so an existing caller sees no change until it opts in.
+    pub native_arrays: bool,
     /// How an existing Delta table is treated. See [`WriteMode`].
     pub mode: WriteMode,
     /// Row ceiling for one in-memory Arrow batch.
@@ -178,6 +195,7 @@ impl Default for LoadConfig {
             tables: None,
             excluded_schemas: None,
             wide_numeric_as_decimal: false,
+            native_arrays: false,
             mode: WriteMode::Overwrite,
             batch_rows: 100_000,
             batch_bytes: 128 << 20,
@@ -322,6 +340,7 @@ struct BlockCtx {
     batch_rows: usize,
     batch_bytes: usize,
     wide_numeric_as_decimal: bool,
+    native_arrays: bool,
 }
 
 /// A unit of work for a decode worker.
@@ -811,6 +830,7 @@ where
                     let schema: ArrowSchemaRef = Arc::new(builders::arrow_schema(
                         &pairs,
                         config.wide_numeric_as_decimal,
+                        config.native_arrays,
                     ));
                     // Almost always already resolved, or close to it: its preload was
                     // started back when this table's CREATE TABLE was parsed, which is
@@ -852,6 +872,7 @@ where
                         batch_rows: config.batch_rows,
                         batch_bytes: config.batch_bytes,
                         wide_numeric_as_decimal: config.wide_numeric_as_decimal,
+                        native_arrays: config.native_arrays,
                     });
                     for tx in job_tx {
                         dispatch(tx, Job::Open(Arc::clone(&ctx)), event_rx)?;
@@ -1160,6 +1181,7 @@ fn worker_loop(
                             ctx.batch_rows,
                             ctx.batch_bytes,
                             ctx.wide_numeric_as_decimal,
+                            ctx.native_arrays,
                         ),
                         writer: TableWriter::new(
                             &ctx.uri,

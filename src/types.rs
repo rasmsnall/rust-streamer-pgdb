@@ -69,10 +69,23 @@ pub struct ResolvedType {
     pub pg: PgType,
     /// True if the declaration carried an array suffix such as `[]` or `[3]`.
     ///
-    /// Arrays are kept as their unescaped PostgreSQL literal, so an array of any element
-    /// type becomes text. This avoids guessing at a nested structure the caller may not
-    /// want, and the literal remains convertible downstream.
+    /// By default, arrays are kept as their unescaped PostgreSQL literal, so an array of
+    /// any element type becomes text: this avoids guessing at a nested structure the
+    /// caller may not want, and the literal remains convertible downstream.
+    /// `LoadConfig::native_arrays` opts a one-dimensional array (see
+    /// [`ResolvedType::array_dimensions`]) whose element type this library can represent
+    /// into a native Arrow `List` instead.
     pub is_array: bool,
+    /// How many `[]`/`[N]` suffixes the declaration carried, for example `2` for
+    /// `integer[][]`. `0` when [`ResolvedType::is_array`] is false.
+    ///
+    /// Only a declaration with exactly one dimension is eligible for
+    /// `LoadConfig::native_arrays`; PostgreSQL's own multi-dimensional arrays are
+    /// rectangular (every sub-array at a given depth has the same length) in a way a
+    /// one-dimensional `array_out` literal parser does not need to enforce, and pg_dump's
+    /// own array syntax nests one brace pair per dimension, which this library does not
+    /// parse. A declaration with more than one dimension keeps degrading to text.
+    pub array_dimensions: u8,
     /// False when the declaration was not recognised and fell back to text.
     ///
     /// User-defined types land here by design. A dump does not distinguish an enum from
@@ -208,7 +221,8 @@ const TEXTUAL: &[&str] = &[
 /// ```
 pub fn resolve(sql_type: &str) -> ResolvedType {
     let source = sql_type.trim().to_string();
-    let (base, is_array) = strip_array_suffix(&source);
+    let (base, array_dimensions) = strip_array_suffix(&source);
+    let is_array = array_dimensions > 0;
     let (name, params) = split_params(base);
     let name = normalise(name);
 
@@ -234,6 +248,7 @@ pub fn resolve(sql_type: &str) -> ResolvedType {
             return ResolvedType {
                 pg: PgType::Text,
                 is_array,
+                array_dimensions,
                 recognised,
                 source,
             };
@@ -243,15 +258,17 @@ pub fn resolve(sql_type: &str) -> ResolvedType {
     ResolvedType {
         pg,
         is_array,
+        array_dimensions,
         recognised: true,
         source,
     }
 }
 
-/// Removes trailing array suffixes such as `[]`, `[3]`, or `[][]`.
-fn strip_array_suffix(s: &str) -> (&str, bool) {
+/// Removes trailing array suffixes such as `[]`, `[3]`, or `[][]`, counting how many were
+/// found.
+fn strip_array_suffix(s: &str) -> (&str, u8) {
     let mut end = s.trim_end();
-    let mut found = false;
+    let mut count: u8 = 0;
     while end.ends_with(']') {
         let Some(open) = end.rfind('[') else { break };
         // Only a dimension suffix qualifies; anything else is left alone.
@@ -262,9 +279,9 @@ fn strip_array_suffix(s: &str) -> (&str, bool) {
             break;
         }
         end = end[..open].trim_end();
-        found = true;
+        count = count.saturating_add(1);
     }
-    (end, found)
+    (end, count)
 }
 
 /// Splits the first parenthesised parameter list out of a type name.
@@ -478,6 +495,15 @@ mod tests {
         }
         // The element type is still resolved, which keeps the stats informative.
         assert_eq!(resolve("integer[]").pg, PgType::Integer);
+    }
+
+    #[test]
+    fn array_dimensions_are_counted() {
+        assert_eq!(resolve("integer").array_dimensions, 0);
+        assert_eq!(resolve("integer[]").array_dimensions, 1);
+        assert_eq!(resolve("integer[3]").array_dimensions, 1);
+        assert_eq!(resolve("integer[][]").array_dimensions, 2);
+        assert_eq!(resolve("integer[][][]").array_dimensions, 3);
     }
 
     #[test]

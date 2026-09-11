@@ -252,6 +252,14 @@ fn parse_mode(mode: &str) -> PyResult<WriteMode> {
 ///     contradicts its declared shape. A ``numeric(p,s)`` with ``p <= 38`` and a scale
 ///     Arrow cannot represent (negative, or exceeding ``p``) is unaffected and keeps
 ///     falling back to text regardless. ``False`` by default.
+/// native_arrays : bool
+///     Map a one-dimensional array whose element type this library can represent to a
+///     native Arrow list, instead of the default text fallback that keeps the array as
+///     PostgreSQL's own ``{...}`` literal. The element type is subject to
+///     ``wide_numeric_as_decimal`` exactly as a plain column of that type would be; an
+///     unrecognised element type leaves the whole array column as text. A declaration
+///     with more than one dimension, such as ``integer[][]``, is unaffected by this flag
+///     and keeps falling back to text. ``False`` by default.
 /// mode : str
 ///     ``"overwrite"``, ``"append"`` or ``"error"``. Overwrite tombstones the previous
 ///     run's files in the same commit that adds the new ones.
@@ -339,6 +347,7 @@ fn parse_mode(mode: &str) -> PyResult<WriteMode> {
     tables = None,
     excluded_schemas = None,
     wide_numeric_as_decimal = false,
+    native_arrays = false,
     mode = "overwrite",
     batch_rows = 100_000,
     batch_bytes = 128 << 20,
@@ -361,6 +370,7 @@ fn stream_dump_to_delta(
     tables: Option<Vec<String>>,
     excluded_schemas: Option<Vec<String>>,
     wide_numeric_as_decimal: bool,
+    native_arrays: bool,
     mode: &str,
     batch_rows: usize,
     batch_bytes: usize,
@@ -392,6 +402,7 @@ fn stream_dump_to_delta(
         tables,
         excluded_schemas,
         wide_numeric_as_decimal,
+        native_arrays,
         mode: parse_mode(mode)?,
         batch_rows,
         batch_bytes,

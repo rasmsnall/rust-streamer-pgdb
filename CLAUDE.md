@@ -243,10 +243,15 @@ These are requirements, not suggestions. They were the starting point of the des
 | `timestamptz` | `Timestamp(Micros, UTC)` |
 | `time` | `Time64(Micros)` |
 | `bytea` | `Binary` (decode `\x` hex; fall back to escape format) |
-| `text`,`varchar`,`char`,`uuid`,`json`,`jsonb`,`inet`,enums,arrays,`interval` | `Utf8` |
+| `text`,`varchar`,`char`,`uuid`,`json`,`jsonb`,`inet`,`interval` | `Utf8` |
+| One-dimensional array of a supported element type | `Utf8`, or `List(element)` with `native_arrays` |
+| Multi-dimensional array, or array of an unsupported element | `Utf8`, always |
 
-Arrays and `interval` stay as their unescaped Postgres literal. This is honest, and avoids
-guessing at a structure the caller may not want. Revisit only if asked.
+`interval` stays as its unescaped Postgres literal always. This is honest, and avoids
+guessing at a structure the caller may not want. An array stays as its unescaped `{...}`
+literal by default for the same reason, but `native_arrays` (asked for 2026-09) opts a
+one-dimensional array of a supported element into a native Arrow `List` instead. Was:
+"Revisit only if asked" — now asked and shipped.
 
 Edge cases that must be handled explicitly: `infinity`/`-infinity` for date and
 timestamp, ` BC` suffixed dates, and `NaN` for numeric.
@@ -272,6 +277,7 @@ pgdelta.stream_dump_to_delta(
     tables=["public.users"],
     excluded_schemas=["audit", "staging"],
     wide_numeric_as_decimal=True,
+    native_arrays=True,
     output_uri="/Volumes/main/raw/pg/",
     mode="overwrite" | "append" | "error",
     batch_rows=100_000,
@@ -470,6 +476,26 @@ Resolved and shipped:
   the column means. Decided with the user: opt-in (not the new default), overflow fails
   the load (not a NULL substitution), and the scope covers both unconstrained and p>38 (not
   just bare `numeric`).
+- `native_arrays=` (default `false`, opt-in): maps a one-dimensional array whose element
+  type has a concrete Arrow mapping to a native `List(element)` instead of the default
+  `{...}` literal text. Gated on two independent things: `types::strip_array_suffix` now
+  counts dimension suffixes rather than just noting "is an array" (`ResolvedType` gained
+  `array_dimensions: u8`), and only a count of exactly 1 qualifies (PostgreSQL's own
+  multi-dimensional arrays are rectangular in a way a 1-D `array_out` parser does not
+  need to enforce, and this library does not parse the nested-brace syntax higher
+  dimensions use); and the element type must not itself be unsupported (unrecognised, or
+  a `numeric` that does not fit even with `wide_numeric_as_decimal`), checked once via
+  `builders::array_element_type`, the single source of truth shared by the schema
+  (`arrow_type`) and the value builder (`ColumnBuilder::new`) so the two cannot disagree.
+  Reading a value is a second, independent layer of escaping on top of `COPY`'s own:
+  `values::parse_array_elements` parses PostgreSQL's `array_out` literal grammar
+  (`{...}`, double-quote-escaped elements, the bare `NULL` token for a null element) and
+  hands each element to the same scalar parser/validator its own column type would use,
+  so an array element gets exactly the same fidelity rules (infinity/NaN degrade, a
+  contradicting value fails the load) as a plain column of that type. Decided with the
+  user: one dimension only (not full multi-dimensional support), opt-in (mirroring
+  `wide_numeric_as_decimal`), and an unsupported element falls the whole column back to
+  text decided once at DDL time (not a per-load failure).
 - Re-run story: `overwrite` is idempotent and a failed run commits nothing, so the
   recovery procedure is to run it again. Documented in `docs/operations.md`, Chapter V.
 - `VACUUM` guidance and a per-table loop are in `docs/operations.md`, Chapter IV.

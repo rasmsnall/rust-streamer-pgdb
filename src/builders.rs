@@ -21,9 +21,10 @@ use std::sync::Arc;
 
 use deltalake::arrow::array::{
     ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Float32Builder,
-    Float64Builder, Int16Builder, Int32Builder, Int64Builder, RecordBatch, StringBuilder,
-    Time64MicrosecondBuilder, TimestampMicrosecondBuilder,
+    Float64Builder, Int16Builder, Int32Builder, Int64Builder, ListArray, RecordBatch,
+    StringBuilder, Time64MicrosecondBuilder, TimestampMicrosecondBuilder,
 };
+use deltalake::arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use deltalake::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 
 use crate::error::{Error, Result};
@@ -45,13 +46,26 @@ const UTC: &str = "UTC";
 
 /// Returns the Arrow type a resolved column maps to.
 ///
-/// Columns that [`ResolvedType::is_textual`] identifies, which covers arrays and
-/// everything unrecognised, map to `Utf8` regardless of their nominal type. A too-wide
-/// `numeric` (see [`types::numeric_too_wide`]) also identifies as textual, but maps
-/// instead to `decimal(38,18)` when `wide_numeric_as_decimal` opts into it.
-pub fn arrow_type(rt: &ResolvedType, wide_numeric_as_decimal: bool) -> DataType {
+/// Columns that [`ResolvedType::is_textual`] identifies, which covers arrays (unless
+/// [`array_element_type`] finds a native mapping under `native_arrays`) and everything
+/// unrecognised, map to `Utf8` regardless of their nominal type. A too-wide `numeric`
+/// (see [`types::numeric_too_wide`]) also identifies as textual, but maps instead to
+/// `decimal(38,18)` when `wide_numeric_as_decimal` opts into it.
+pub fn arrow_type(
+    rt: &ResolvedType,
+    wide_numeric_as_decimal: bool,
+    native_arrays: bool,
+) -> DataType {
+    if rt.is_array {
+        if native_arrays && rt.array_dimensions == 1 {
+            let element_rt = as_element(rt);
+            if let Some(element_type) = array_element_type(&element_rt, wide_numeric_as_decimal) {
+                return DataType::List(Arc::new(Field::new("item", element_type, true)));
+            }
+        }
+        return DataType::Utf8;
+    }
     if let PgType::Numeric { precision, .. } = rt.pg
-        && !rt.is_array
         && wide_numeric_as_decimal
         && types::numeric_too_wide(precision)
     {
@@ -82,12 +96,63 @@ pub fn arrow_type(rt: &ResolvedType, wide_numeric_as_decimal: bool) -> DataType 
     }
 }
 
+/// `rt`, treated as its own element type: `is_array` cleared and `array_dimensions` zeroed.
+///
+/// Used to resolve a one-dimensional array's element type by recursing into the same
+/// scalar logic ([`arrow_type`], [`ColumnBuilder::new`]) a plain column of that type
+/// would use, rather than duplicating it.
+fn as_element(rt: &ResolvedType) -> ResolvedType {
+    ResolvedType {
+        is_array: false,
+        array_dimensions: 0,
+        ..rt.clone()
+    }
+}
+
+/// Returns the Arrow type a one-dimensional array's element maps to, or `None` if the
+/// element type is not one `native_arrays` supports, in which case the whole array column
+/// falls back to text (see [`arrow_type`]).
+///
+/// Unsupported means: `rt.pg` is `Text` and [`ResolvedType::recognised`] is false (an
+/// enum, domain, composite, or anything else this library could not identify), or `rt.pg`
+/// is `Numeric` with a precision or scale that does not fit natively and either
+/// `wide_numeric_as_decimal` is off or the shape is the narrower "scale Arrow cannot
+/// represent" problem `wide_numeric_as_decimal` does not cover (see
+/// [`types::numeric_too_wide`]). Every other `PgType` always has a concrete Arrow mapping.
+///
+/// `rt` must already be de-arrayed, as [`as_element`] produces.
+fn array_element_type(rt: &ResolvedType, wide_numeric_as_decimal: bool) -> Option<DataType> {
+    debug_assert!(!rt.is_array);
+    let unsupported = match rt.pg {
+        PgType::Text => !rt.recognised,
+        PgType::Numeric { precision, .. } => {
+            rt.is_textual() && !(wide_numeric_as_decimal && types::numeric_too_wide(precision))
+        }
+        _ => false,
+    };
+    if unsupported {
+        None
+    } else {
+        Some(arrow_type(rt, wide_numeric_as_decimal, false))
+    }
+}
+
 /// Builds the Arrow schema for a table's columns.
-pub fn arrow_schema(columns: &[(String, ResolvedType)], wide_numeric_as_decimal: bool) -> Schema {
+pub fn arrow_schema(
+    columns: &[(String, ResolvedType)],
+    wide_numeric_as_decimal: bool,
+    native_arrays: bool,
+) -> Schema {
     Schema::new(
         columns
             .iter()
-            .map(|(name, rt)| Field::new(name, arrow_type(rt, wide_numeric_as_decimal), true))
+            .map(|(name, rt)| {
+                Field::new(
+                    name,
+                    arrow_type(rt, wide_numeric_as_decimal, native_arrays),
+                    true,
+                )
+            })
             .collect::<Vec<_>>(),
     )
 }
@@ -121,6 +186,19 @@ pub enum ColumnBuilder {
     Time(Time64MicrosecondBuilder),
     /// `bytea`.
     Binary(BinaryBuilder),
+    /// A one-dimensional array, native to Arrow under `native_arrays`. `element` is any
+    /// non-array variant, reused to parse, validate and store each array's elements
+    /// exactly as it would that same type's own scalar column. `offsets` and `validity`
+    /// are this list's own bookkeeping: one more `offsets` entry than rows, and one
+    /// `validity` entry per row.
+    List {
+        /// Builder for the flattened element values, of any non-array variant.
+        element: Box<ColumnBuilder>,
+        /// Cumulative element count after each row; always starts as `[0]`.
+        offsets: Vec<i32>,
+        /// Whether each row's array itself (not its elements) is non-null.
+        validity: Vec<bool>,
+    },
     /// Text, and everything that degrades to it.
     Utf8(StringBuilder),
 }
@@ -129,19 +207,37 @@ impl ColumnBuilder {
     /// Creates a builder matching `rt`.
     ///
     /// The builder must agree with [`arrow_type`], because the schema is built from the
-    /// latter and [`BatchBuilder::finish`] would otherwise fail: both check a too-wide
-    /// `numeric` against `wide_numeric_as_decimal` first, then fall back to
-    /// [`ResolvedType::is_textual`], which routes anything else Arrow cannot represent
-    /// (arrays, everything unrecognised) to text.
+    /// latter and [`BatchBuilder::finish`] would otherwise fail: both check a
+    /// one-dimensional array against `native_arrays` and a too-wide `numeric` against
+    /// `wide_numeric_as_decimal` first, then fall back to [`ResolvedType::is_textual`],
+    /// which routes anything else Arrow cannot represent (a multi-dimensional array,
+    /// anything unrecognised) to text.
     ///
     /// # Panics
     ///
     /// Does not panic. The decimal fallbacks below are unreachable defence: if either
     /// ever did fire, the mismatch with [`arrow_type`] would surface as [`Error::Arrow`]
     /// on the next flush rather than as a panic here.
-    pub fn new(rt: &ResolvedType, wide_numeric_as_decimal: bool) -> Self {
+    pub fn new(rt: &ResolvedType, wide_numeric_as_decimal: bool, native_arrays: bool) -> Self {
+        if rt.is_array {
+            if native_arrays && rt.array_dimensions == 1 {
+                let element_rt = as_element(rt);
+                if array_element_type(&element_rt, wide_numeric_as_decimal).is_some() {
+                    let element = Box::new(ColumnBuilder::new(
+                        &element_rt,
+                        wide_numeric_as_decimal,
+                        native_arrays,
+                    ));
+                    return ColumnBuilder::List {
+                        element,
+                        offsets: vec![0],
+                        validity: Vec::new(),
+                    };
+                }
+            }
+            return ColumnBuilder::Utf8(StringBuilder::new());
+        }
         if let PgType::Numeric { precision, .. } = rt.pg
-            && !rt.is_array
             && wide_numeric_as_decimal
             && types::numeric_too_wide(precision)
         {
@@ -230,6 +326,29 @@ impl ColumnBuilder {
                 values::parse_bytea(v, column, &mut buf)?;
                 b.append_value(&buf);
             }
+            ColumnBuilder::List {
+                element,
+                offsets,
+                validity,
+            } => {
+                // Every element goes through the same parser and validation its own
+                // scalar column would use, including the unquoted `NULL` token landing
+                // as a genuine null element rather than a substitution: see
+                // values::parse_array_elements.
+                let elements = values::parse_array_elements(v, column)?;
+                for elem in &elements {
+                    substituted |= element.append(elem.as_deref(), column)?;
+                }
+                let overflow = || Error::UnparsableValue {
+                    column: column.to_string(),
+                    expected: "array",
+                };
+                let count = i32::try_from(elements.len()).map_err(|_| overflow())?;
+                // `offsets` always holds at least one entry (see `ColumnBuilder::new`).
+                let last = *offsets.last().expect("offsets is never empty");
+                offsets.push(last.checked_add(count).ok_or_else(overflow)?);
+                validity.push(true);
+            }
             ColumnBuilder::Utf8(b) => {
                 let s = std::str::from_utf8(v).map_err(|_| Error::NonUtf8Text {
                     column: column.to_string(),
@@ -254,11 +373,24 @@ impl ColumnBuilder {
             ColumnBuilder::Timestamp(b, _) => b.append_null(),
             ColumnBuilder::Time(b) => b.append_null(),
             ColumnBuilder::Binary(b) => b.append_null(),
+            ColumnBuilder::List {
+                offsets, validity, ..
+            } => {
+                // A null array contributes no elements: the offset simply repeats.
+                let last = *offsets.last().expect("offsets is never empty");
+                offsets.push(last);
+                validity.push(false);
+            }
             ColumnBuilder::Utf8(b) => b.append_null(),
         }
     }
 
     /// Finishes the current batch and resets the builder for reuse.
+    ///
+    /// # Panics
+    ///
+    /// Does not panic, except for an unreachable internal-invariant violation in the
+    /// `List` case: see the comment at its `ListArray::try_new` call.
     pub fn finish(&mut self) -> ArrayRef {
         match self {
             ColumnBuilder::Int16(b) => Arc::new(b.finish()),
@@ -277,6 +409,28 @@ impl ColumnBuilder {
             }
             ColumnBuilder::Time(b) => Arc::new(b.finish()),
             ColumnBuilder::Binary(b) => Arc::new(b.finish()),
+            ColumnBuilder::List {
+                element,
+                offsets,
+                validity,
+            } => {
+                let values = element.finish();
+                // The field's type is taken from the values array actually produced,
+                // rather than recomputed, so the two cannot disagree.
+                let field = Arc::new(Field::new("item", values.data_type().clone(), true));
+                let offsets =
+                    OffsetBuffer::new(ScalarBuffer::from(std::mem::replace(offsets, vec![0])));
+                let nulls = NullBuffer::from(std::mem::take(validity));
+                // `offsets`, `values` and `nulls` are this builder's own bookkeeping,
+                // kept in lockstep by `append`/`append_null` above, so the only way
+                // `try_new` rejects them is a bug in that bookkeeping. A bug there must
+                // not silently commit a mismatched or short array, which is why this
+                // panics rather than falling back to something plausible-looking.
+                Arc::new(
+                    ListArray::try_new(field, offsets, values, Some(nulls))
+                        .expect("list builder offsets/values/nulls must already agree"),
+                )
+            }
             ColumnBuilder::Utf8(b) => Arc::new(b.finish()),
         }
     }
@@ -307,13 +461,18 @@ impl BatchBuilder {
         max_rows: usize,
         max_bytes: usize,
         wide_numeric_as_decimal: bool,
+        native_arrays: bool,
     ) -> Self {
         Self {
-            schema: Arc::new(arrow_schema(columns, wide_numeric_as_decimal)),
+            schema: Arc::new(arrow_schema(
+                columns,
+                wide_numeric_as_decimal,
+                native_arrays,
+            )),
             names: columns.iter().map(|(n, _)| n.clone()).collect(),
             columns: columns
                 .iter()
-                .map(|(_, rt)| ColumnBuilder::new(rt, wide_numeric_as_decimal))
+                .map(|(_, rt)| ColumnBuilder::new(rt, wide_numeric_as_decimal, native_arrays))
                 .collect(),
             rows: 0,
             bytes: 0,
@@ -453,33 +612,51 @@ mod tests {
 
     #[test]
     fn types_map_as_documented() {
-        assert_eq!(arrow_type(&resolve("smallint"), false), DataType::Int16);
-        assert_eq!(arrow_type(&resolve("integer"), false), DataType::Int32);
-        assert_eq!(arrow_type(&resolve("bigint"), false), DataType::Int64);
-        assert_eq!(arrow_type(&resolve("real"), false), DataType::Float32);
         assert_eq!(
-            arrow_type(&resolve("double precision"), false),
+            arrow_type(&resolve("smallint"), false, false),
+            DataType::Int16
+        );
+        assert_eq!(
+            arrow_type(&resolve("integer"), false, false),
+            DataType::Int32
+        );
+        assert_eq!(
+            arrow_type(&resolve("bigint"), false, false),
+            DataType::Int64
+        );
+        assert_eq!(
+            arrow_type(&resolve("real"), false, false),
+            DataType::Float32
+        );
+        assert_eq!(
+            arrow_type(&resolve("double precision"), false, false),
             DataType::Float64
         );
-        assert_eq!(arrow_type(&resolve("boolean"), false), DataType::Boolean);
-        assert_eq!(arrow_type(&resolve("date"), false), DataType::Date32);
-        assert_eq!(arrow_type(&resolve("bytea"), false), DataType::Binary);
         assert_eq!(
-            arrow_type(&resolve("numeric(10,2)"), false),
+            arrow_type(&resolve("boolean"), false, false),
+            DataType::Boolean
+        );
+        assert_eq!(arrow_type(&resolve("date"), false, false), DataType::Date32);
+        assert_eq!(
+            arrow_type(&resolve("bytea"), false, false),
+            DataType::Binary
+        );
+        assert_eq!(
+            arrow_type(&resolve("numeric(10,2)"), false, false),
             DataType::Decimal128(10, 2)
         );
         assert_eq!(
-            arrow_type(&resolve("timestamp without time zone"), false),
+            arrow_type(&resolve("timestamp without time zone"), false, false),
             DataType::Timestamp(TimeUnit::Microsecond, Some(UTC.into())),
             "a naive timestamp must carry a timezone in its Arrow type too, or delta-rs \
              maps it to timestamp_ntz instead of timestamp"
         );
         assert_eq!(
-            arrow_type(&resolve("timestamp with time zone"), false),
+            arrow_type(&resolve("timestamp with time zone"), false, false),
             DataType::Timestamp(TimeUnit::Microsecond, Some(UTC.into()))
         );
         assert_eq!(
-            arrow_type(&resolve("time without time zone"), false),
+            arrow_type(&resolve("time without time zone"), false, false),
             DataType::Time64(TimeUnit::Microsecond)
         );
     }
@@ -494,7 +671,7 @@ mod tests {
             "interval",
             "jsonb",
         ] {
-            assert_eq!(arrow_type(&resolve(t), false), DataType::Utf8, "{t}");
+            assert_eq!(arrow_type(&resolve(t), false, false), DataType::Utf8, "{t}");
         }
     }
 
@@ -504,35 +681,122 @@ mod tests {
     #[test]
     fn wide_numeric_as_decimal_only_affects_too_wide_numeric() {
         assert_eq!(
-            arrow_type(&resolve("numeric"), true),
+            arrow_type(&resolve("numeric"), true, false),
             DataType::Decimal128(38, 18),
             "unconstrained numeric"
         );
         assert_eq!(
-            arrow_type(&resolve("numeric(39,2)"), true),
+            arrow_type(&resolve("numeric(39,2)"), true, false),
             DataType::Decimal128(38, 18),
             "precision over 38"
         );
         assert_eq!(
-            arrow_type(&resolve("numeric(10,2)"), true),
+            arrow_type(&resolve("numeric(10,2)"), true, false),
             DataType::Decimal128(10, 2),
             "already fits natively; must not be widened"
         );
         assert_eq!(
-            arrow_type(&resolve("numeric(2,5)"), true),
+            arrow_type(&resolve("numeric(2,5)"), true, false),
             DataType::Utf8,
             "scale exceeding precision is a different problem, unaffected by this flag"
         );
         assert_eq!(
-            arrow_type(&resolve("numeric(5,-2)"), true),
+            arrow_type(&resolve("numeric(5,-2)"), true, false),
             DataType::Utf8,
             "negative scale is a different problem, unaffected by this flag"
         );
         assert_eq!(
-            arrow_type(&resolve("numeric[]"), true),
+            arrow_type(&resolve("numeric[]"), true, false),
             DataType::Utf8,
             "arrays stay text regardless of this flag"
         );
+    }
+
+    /// `native_arrays` maps a one-dimensional array to `List<element>` only when the
+    /// element type itself has a concrete mapping; everything else (multi-dimensional,
+    /// an unsupported element) is unaffected and keeps falling back to text.
+    #[test]
+    fn native_arrays_only_affects_one_dimensional_arrays_of_a_supported_element() {
+        assert_eq!(
+            arrow_type(&resolve("integer[]"), false, true),
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+        );
+        assert_eq!(
+            arrow_type(&resolve("text[]"), false, true),
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            "a recognised textual element must still become a native list of Utf8"
+        );
+        assert_eq!(
+            arrow_type(&resolve("integer[][]"), false, true),
+            DataType::Utf8,
+            "multi-dimensional arrays are unsupported regardless of this flag"
+        );
+        assert_eq!(
+            arrow_type(&resolve("public.my_enum[]"), false, true),
+            DataType::Utf8,
+            "an unrecognised element type falls the whole column back to text"
+        );
+        assert_eq!(
+            arrow_type(&resolve("numeric[]"), false, true),
+            DataType::Utf8,
+            "an unconstrained numeric element without wide_numeric_as_decimal is unsupported"
+        );
+        assert_eq!(
+            arrow_type(&resolve("numeric[]"), true, true),
+            DataType::List(Arc::new(Field::new(
+                "item",
+                DataType::Decimal128(38, 18),
+                true
+            ))),
+            "wide_numeric_as_decimal applies to an array's element exactly as it would a \
+             plain column of that type"
+        );
+        assert_eq!(
+            arrow_type(&resolve("integer[]"), false, false),
+            DataType::Utf8,
+            "off by default"
+        );
+    }
+
+    #[test]
+    fn native_array_values_round_trip_including_nulls() {
+        let columns = cols(&[("tags", "integer[]")]);
+        let mut b = BatchBuilder::new(&columns, 10, 1 << 20, false, true);
+
+        b.append_row(&[Some(b"{1,2,3}".as_slice())]).unwrap();
+        b.append_row(&[Some(b"{4,NULL,6}".as_slice())]).unwrap();
+        b.append_row(&[None]).unwrap(); // The array itself is null.
+        b.append_row(&[Some(b"{}".as_slice())]).unwrap(); // An empty array is not null.
+
+        let batch = b.finish().unwrap().unwrap();
+        let list = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+
+        assert_eq!(list.len(), 4);
+        assert!(!list.is_null(0));
+        assert!(!list.is_null(1));
+        assert!(list.is_null(2));
+        assert!(!list.is_null(3));
+
+        let row0 = list.value(0);
+        let row0 = row0.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(
+            row0.iter().collect::<Vec<_>>(),
+            vec![Some(1), Some(2), Some(3)]
+        );
+
+        let row1 = list.value(1);
+        let row1 = row1.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(
+            row1.iter().collect::<Vec<_>>(),
+            vec![Some(4), None, Some(6)]
+        );
+
+        let row3 = list.value(3);
+        assert_eq!(row3.len(), 0, "an empty array must have no elements");
     }
 
     #[test]
@@ -545,7 +809,7 @@ mod tests {
             ("born", "date"),
             ("blob", "bytea"),
         ]);
-        let mut b = BatchBuilder::new(&columns, 1000, 1 << 20, false);
+        let mut b = BatchBuilder::new(&columns, 1000, 1 << 20, false, false);
 
         b.append_row(&[
             Some(b"1"),
@@ -612,7 +876,7 @@ mod tests {
     #[test]
     fn finish_resets_for_reuse() {
         let columns = cols(&[("id", "integer")]);
-        let mut b = BatchBuilder::new(&columns, 1000, 1 << 20, false);
+        let mut b = BatchBuilder::new(&columns, 1000, 1 << 20, false, false);
         b.append_row(&[Some(b"1")]).unwrap();
         assert_eq!(b.finish().unwrap().unwrap().num_rows(), 1);
         assert_eq!(b.rows(), 0);
@@ -627,7 +891,7 @@ mod tests {
     #[test]
     fn unrepresentable_values_become_null_and_are_counted() {
         let columns = cols(&[("t", "timestamp without time zone"), ("n", "numeric(5,2)")]);
-        let mut b = BatchBuilder::new(&columns, 1000, 1 << 20, false);
+        let mut b = BatchBuilder::new(&columns, 1000, 1 << 20, false, false);
         b.append_row(&[Some(b"infinity"), Some(b"NaN")]).unwrap();
         b.append_row(&[Some(b"1970-01-01 00:00:00"), Some(b"1.00")])
             .unwrap();
@@ -641,7 +905,7 @@ mod tests {
     #[test]
     fn timestamptz_carries_utc_in_its_type() {
         let columns = cols(&[("t", "timestamp with time zone")]);
-        let mut b = BatchBuilder::new(&columns, 10, 1 << 20, false);
+        let mut b = BatchBuilder::new(&columns, 10, 1 << 20, false, false);
         b.append_row(&[Some(b"2024-01-01 13:00:00+01")]).unwrap();
         let batch = b.finish().unwrap().unwrap();
         assert_eq!(
@@ -657,7 +921,7 @@ mod tests {
     #[test]
     fn arity_mismatch_is_rejected() {
         let columns = cols(&[("a", "integer"), ("b", "integer")]);
-        let mut b = BatchBuilder::new(&columns, 10, 1 << 20, false);
+        let mut b = BatchBuilder::new(&columns, 10, 1 << 20, false, false);
         assert_eq!(
             b.append_row(&[Some(b"1")]).unwrap_err(),
             Error::FieldCountMismatch {
@@ -670,7 +934,7 @@ mod tests {
     #[test]
     fn malformed_value_fails_the_load() {
         let columns = cols(&[("a", "integer")]);
-        let mut b = BatchBuilder::new(&columns, 10, 1 << 20, false);
+        let mut b = BatchBuilder::new(&columns, 10, 1 << 20, false, false);
         assert!(matches!(
             b.append_row(&[Some(b"not-a-number")]),
             Err(Error::UnparsableValue { .. })
@@ -680,7 +944,7 @@ mod tests {
     #[test]
     fn non_utf8_text_fails_rather_than_corrupting() {
         let columns = cols(&[("a", "text")]);
-        let mut b = BatchBuilder::new(&columns, 10, 1 << 20, false);
+        let mut b = BatchBuilder::new(&columns, 10, 1 << 20, false, false);
         assert!(matches!(
             b.append_row(&[Some(&[0xFF, 0xFE])]),
             Err(Error::NonUtf8Text { .. })
@@ -690,14 +954,14 @@ mod tests {
     #[test]
     fn bounds_signal_when_to_flush() {
         let columns = cols(&[("a", "integer")]);
-        let mut b = BatchBuilder::new(&columns, 2, 1 << 20, false);
+        let mut b = BatchBuilder::new(&columns, 2, 1 << 20, false, false);
         assert!(!b.is_full());
         b.append_row(&[Some(b"1")]).unwrap();
         assert!(!b.is_full());
         b.append_row(&[Some(b"2")]).unwrap();
         assert!(b.is_full());
 
-        let mut b = BatchBuilder::new(&columns, 1_000_000, 4, false);
+        let mut b = BatchBuilder::new(&columns, 1_000_000, 4, false, false);
         b.append_row(&[Some(b"12345")]).unwrap();
         assert!(b.is_full(), "byte bound must also trigger a flush");
     }
@@ -705,7 +969,7 @@ mod tests {
     #[test]
     fn array_columns_keep_their_postgres_literal() {
         let columns = cols(&[("tags", "text[]")]);
-        let mut b = BatchBuilder::new(&columns, 10, 1 << 20, false);
+        let mut b = BatchBuilder::new(&columns, 10, 1 << 20, false, false);
         b.append_row(&[Some(b"{a,b,c}")]).unwrap();
         let batch = b.finish().unwrap().unwrap();
         let got = batch
