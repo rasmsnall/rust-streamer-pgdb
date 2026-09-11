@@ -402,6 +402,27 @@ Resolved and shipped:
   TABLE` only well enough to find its end, never parsing a column. Unlike `tables`, this
   means a DDL construct this library cannot parse, in a schema nobody wanted, cannot fail
   the load. Exclusion wins over a name also listed in `tables`.
+- Small-table overhead: a dump of ~450-600 mostly-tiny tables was measured serialising
+  almost entirely on per-table storage round trips rather than decode. Two fixes:
+  - Table opens are prefetched. `sink::preload_table` (the existence/schema check, no
+    dependency on the dump's `COPY` column order) starts the moment a table's `CREATE
+    TABLE` is parsed, bounded to a small concurrent window (reusing
+    `DEFAULT_COMMIT_CONCURRENCY` as the sizing rule), instead of blocking the reader once
+    per table right as its `COPY` block starts.
+  - `sink::SharedStore` resolves one object-store client for `output_uri` and every
+    table's open decorates it with its own path prefix, instead of building a fresh
+    client (and, under identity-based cloud auth, fetching a fresh token) per table.
+    Confirmed via delta-rs source (`logstore_for` / `object_store_factories`, deltalake
+    0.32.4): nothing caches this internally. Local paths and `/Volumes/...` are
+    unaffected; this matters for `abfss://`, `s3://`, `gs://`. The Parquet *writer* could
+    not be given the same treatment: `RecordBatchWriter`'s only constructor that accepts
+    a pre-built `DeltaTable` (`new_with_table`) is crate-private in delta-rs 0.32.4, and
+    its public alternative (`for_table`) derives the schema from the table's own
+    committed metadata, which is wrong exactly when schema drift matters (`overwrite`
+    with a changed schema). Revisit if a future delta-rs version makes that constructor
+    public.
+  - Verified only on local-filesystem storage in this environment; the code path for
+    `abfss://`/`s3://`/`gs://` is unverified against a real backend.
 - Re-run story: `overwrite` is idempotent and a failed run commits nothing, so the
   recovery procedure is to run it again. Documented in `docs/operations.md`, Chapter V.
 - `VACUUM` guidance and a per-table loop are in `docs/operations.md`, Chapter IV.

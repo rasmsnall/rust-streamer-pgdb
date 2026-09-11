@@ -57,6 +57,8 @@ use deltalake::arrow::datatypes::SchemaRef as ArrowSchemaRef;
 use deltalake::kernel::Action;
 use futures::StreamExt;
 use tokio::runtime::Handle;
+use tokio::sync::Semaphore;
+use tokio::task::JoinHandle;
 
 use crate::builders::{self, BatchBuilder};
 use crate::chan::{self, bounded};
@@ -65,7 +67,8 @@ use crate::dump::{ChunkReader, decompressed};
 use crate::error::{Error, Result};
 use crate::scan::{Event, Scanner, TableDef, TableName};
 use crate::sink::{
-    SchemaDrift, TableWriter, WriteMode, commit_table, open_table, reject_managed_storage,
+    PreloadedTable, SchemaDrift, TableWriter, WriteMode, commit_table, finish_open, preload_table,
+    reject_managed_storage,
 };
 use crate::types::{self, ResolvedType};
 
@@ -501,6 +504,15 @@ where
         })?;
     let handle = runtime.handle().clone();
 
+    // Resolved once so every table's preload decorates this store with its own path
+    // rather than building a fresh backend client each time; see sink::SharedStore.
+    // Entering the runtime guards against a backend client that expects a Tokio context
+    // to exist even for the synchronous parts of construction.
+    let shared_store = {
+        let _guard = runtime.enter();
+        crate::sink::SharedStore::resolve(&config.output_uri, &config.storage_options)?
+    };
+
     let (event_tx, event_rx) = bounded::<WorkerEvent>(threads * 2 + 4);
     let mut job_tx: Vec<chan::Sender<Job>> = Vec::with_capacity(threads);
     let mut joins = Vec::with_capacity(threads);
@@ -519,7 +531,14 @@ where
     // and so that a failure to open still tears the pool down cleanly.
     let outcome = match open(&handle) {
         Ok(input) => drive(
-            input, config, progress, &handle, &job_tx, &event_rx, threads,
+            input,
+            config,
+            progress,
+            &handle,
+            &job_tx,
+            &event_rx,
+            threads,
+            &shared_store,
         ),
         Err(err) => Err(err),
     };
@@ -618,6 +637,7 @@ fn drive<F>(
     job_tx: &[chan::Sender<Job>],
     event_rx: &chan::Receiver<WorkerEvent>,
     threads: usize,
+    shared_store: &crate::sink::SharedStore,
 ) -> Result<LoadReport>
 where
     F: FnMut(Progress) -> bool,
@@ -680,6 +700,26 @@ where
     };
     let wanted = |table: &TableName, qualified: &str| allowed(qualified) && !schema_excluded(table);
 
+    // A table's existence and, if it exists, its current schema can be checked as soon as
+    // its `CREATE TABLE` is parsed: that check needs no schema of its own, only the name.
+    // Starting it here, rather than when the table's `COPY` block reaches the front of the
+    // scan, overlaps its storage round trip with whatever table is currently being decoded
+    // instead of stalling the reader thread on it. Every `CREATE TABLE` in the dump is seen
+    // before any `COPY` block (see the module docs' ordering guarantee), so this can run
+    // arbitrarily far ahead; the semaphore is what keeps that from meaning "every wanted
+    // table in the dump, all requested from storage at once".
+    //
+    // Reuses `DEFAULT_COMMIT_CONCURRENCY` as a sizing rule of thumb rather than adding a
+    // config knob: both this and the phase-two commit burst are small metadata round trips
+    // bounded by storage latency, not CPU, so the same concurrency that suits one suits
+    // the other.
+    let open_concurrency = match config.commit_concurrency {
+        0 => DEFAULT_COMMIT_CONCURRENCY,
+        n => n,
+    };
+    let open_semaphore = Arc::new(Semaphore::new(open_concurrency));
+    let mut preloads: HashMap<String, JoinHandle<Result<PreloadedTable>>> = HashMap::new();
+
     while let Some(chunk) = chunks.next_chunk()? {
         let bytes_read = consumed.load(Ordering::Relaxed);
 
@@ -699,7 +739,26 @@ where
                 }
 
                 Event::Table(def) => {
-                    table_defs.insert(def.name.qualified(), def);
+                    let qualified = def.name.qualified();
+                    if wanted(&def.name, &qualified) {
+                        let permit = handle
+                            .block_on(Arc::clone(&open_semaphore).acquire_owned())
+                            .map_err(|_| Error::Internal {
+                                detail: "table-open semaphore closed unexpectedly",
+                            })?;
+                        let prefix = config.output_uri.clone();
+                        let table_name = def.name.clone();
+                        let storage_options = config.storage_options.clone();
+                        let store = shared_store.clone();
+                        let task = handle.spawn(async move {
+                            let result =
+                                preload_table(&prefix, &table_name, &store, &storage_options).await;
+                            drop(permit);
+                            result
+                        });
+                        preloads.insert(qualified.clone(), task);
+                    }
+                    table_defs.insert(qualified, def);
                 }
 
                 Event::CopyStart { table, columns } => {
@@ -729,13 +788,24 @@ where
                     let pairs: Vec<(String, ResolvedType)> =
                         columns.iter().cloned().zip(resolved).collect();
                     let schema: ArrowSchemaRef = Arc::new(builders::arrow_schema(&pairs));
-                    let opened = handle.block_on(open_table(
-                        &config.output_uri,
-                        &table,
-                        &schema,
-                        config.mode,
-                        &config.storage_options,
-                    ))?;
+                    // Almost always already resolved, or close to it: its preload was
+                    // started back when this table's CREATE TABLE was parsed, which is
+                    // necessarily before any COPY block in the dump. Falling back to an
+                    // on-demand preload is a safety net for a path no known dump takes,
+                    // rather than an invariant relied upon.
+                    let preloaded = match preloads.remove(&qualified) {
+                        Some(task) => handle.block_on(task).map_err(|_| Error::Internal {
+                            detail: "table preload task panicked",
+                        })??,
+                        None => handle.block_on(preload_table(
+                            &config.output_uri,
+                            &table,
+                            shared_store,
+                            &config.storage_options,
+                        ))?,
+                    };
+                    let opened =
+                        handle.block_on(finish_open(preloaded, &table, &schema, config.mode))?;
                     let uri = opened.uri.clone();
                     let drift = opened.drift.clone();
                     open_tables.push(CommitTarget {
@@ -896,6 +966,13 @@ where
         }) {
             return Err(Error::Interrupted);
         }
+    }
+
+    // Every preload should already have been consumed by its table's COPY block; a
+    // survivor here means a CREATE TABLE whose COPY never arrived, which a well-formed
+    // dump does not do. Abort it rather than leave it running into phase two.
+    for (_, task) in preloads.drain() {
+        task.abort();
     }
 
     // Structural checks: an unterminated block or a missing version comment fails here.
@@ -1334,9 +1411,14 @@ COPY public.t (id) FROM stdin;
         };
         let err = run(Cursor::new(dump(TWO_TABLES)), &config, |_| false).unwrap_err();
         assert_eq!(err, Error::Interrupted);
+        // Its directory may exist: a table's preload starts as soon as its CREATE TABLE
+        // is parsed, well ahead of its COPY block, and creating the directory is an
+        // unavoidable side effect of delta-rs's ensure_table_uri on a local path (see
+        // sink::preload_table). What must not exist is a Delta table: no log means no
+        // reader can see it as one.
         assert!(
-            !dir.join("public/events").exists(),
-            "the block after the interrupt must never be opened"
+            !dir.join("public/events/_delta_log").exists(),
+            "the block after the interrupt must never become a Delta table"
         );
 
         let log = dir.join("public/users/_delta_log");

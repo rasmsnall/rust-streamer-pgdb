@@ -291,6 +291,30 @@ batches accumulate into each Parquet file, targeting roughly 256 MB to 1 GB writ
 Emitting one small file per batch across hundreds of tables produces small-file sprawl
 that degrades every downstream query.
 
+Opening a table, checking whether it already exists and, for a cloud target, reading its
+Delta log, is a storage round trip like any other write. With hundreds of tables this cost
+does not go away, but two things keep it off the critical path:
+
+- **Opens are prefetched.** Every `CREATE TABLE` in the dump is seen before any `COPY`
+  block (Chapter II, Section 2), so a table's existence check
+  ([`sink::preload_table`]) starts the moment its DDL is parsed, bounded to a small
+  concurrent window, rather than blocking the reader right as its `COPY` block starts. By
+  the time that block is reached the check has usually already finished.
+- **One object-store client per load, not one per table.** Resolving a URL into a store
+  splits it into a client rooted at the whole storage account or container and a path
+  prefix within it, specifically so many objects under one account can share the client.
+  [`sink::SharedStore`] resolves that client once for `output_uri` and every table's open
+  decorates it with its own prefix instead of building a fresh client (and, for
+  identity-based cloud auth, fetching a fresh token). Local paths and `/Volumes/...` FUSE
+  mounts have no client to share, so this only matters for `abfss://`, `s3://` and `gs://`
+  targets.
+
+Parquet writers are unaffected by the second point: delta-rs's writer only exposes a
+constructor that resolves its own store from a URI, with no way to hand it one, so each
+writer still resolves independently. Because chunk dispatch keeps a table that fits in one
+chunk on a single worker (Chapter IV, Section 3), this is one writer per table for the
+common case of many small tables, not one per worker per table.
+
 ---
 
 ## IV. Concurrency Model

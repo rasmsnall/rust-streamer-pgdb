@@ -35,7 +35,7 @@ deltalake = "0.32.4"
 
 # Already compiled as part of the deltalake tree; declared so the crate can name them.
 # Pinned to the versions deltalake already resolves, so no duplicate copy is built.
-tokio = { version = "1.53.1", features = ["rt", "rt-multi-thread"] }
+tokio = { version = "1.53.1", features = ["rt", "rt-multi-thread", "sync"] }
 futures = "0.3.34"
 # Reading the dump straight out of cloud storage. The cloud backends are switched on by
 # deltalake's features rather than here, so the two cannot select different ones.

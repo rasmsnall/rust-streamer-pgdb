@@ -35,10 +35,11 @@ use deltalake::arrow::datatypes::{Schema as ArrowSchema, SchemaRef as ArrowSchem
 use deltalake::kernel::engine::arrow_conversion::TryIntoKernel;
 use deltalake::kernel::transaction::{CommitBuilder, TableReference};
 use deltalake::kernel::{Action, MetadataExt, StructType};
+use deltalake::logstore::LogStore;
 use deltalake::protocol::{DeltaOperation, SaveMode};
 use deltalake::table::builder::ensure_table_uri;
 use deltalake::writer::{DeltaWriter, RecordBatchWriter};
-use deltalake::{DeltaTable, DeltaTableBuilder};
+use deltalake::{DeltaTable, DeltaTableBuilder, ObjectStore};
 use futures::TryStreamExt;
 
 use crate::error::{Error, Result};
@@ -318,16 +319,201 @@ pub struct OpenedTable {
     pub drift: SchemaDrift,
 }
 
-/// Opens the Delta table for `table_name` beneath `prefix`, creating it on a first run.
+/// A table whose existence and, if it already existed, current schema have been checked,
+/// but which has not yet been created or diffed against an incoming schema.
 ///
-/// The returned table is loaded and ready for a [`TableWriter`]. Creation is the only
-/// step that must happen once per table rather than once per writer, so the parallel
-/// pipeline calls this on the reader thread before fanning work to the decode pool.
+/// The network-bound part of opening a table (reading its Delta log, if any) needs no
+/// schema at all, only the table's name. Separating it out lets a caller start it as soon
+/// as a `CREATE TABLE` is parsed, well before the `COPY` block that carries the exact,
+/// possibly reordered column list [`finish_open`] needs. See [`preload_table`].
+#[derive(Debug)]
+pub struct PreloadedTable {
+    table: DeltaTable,
+    uri: String,
+    /// The table's current schema, or `None` for a table with no Delta log yet, meaning
+    /// [`finish_open`] must create it.
+    existing_schema: Option<StructType>,
+}
+
+/// The object store backing every table beneath one output prefix, resolved once.
+///
+/// Resolving a URL into a store normally builds a fresh backend client: for a cloud
+/// target, a new HTTP client and, under identity-based auth (managed identity, workload
+/// identity), a fresh token fetch. `object_store` splits a location into a store rooted at
+/// the whole storage account/container and a path prefix within it precisely so many
+/// objects under one account can share the root store; a dump's few hundred tables all
+/// sit under the same `output_uri` account/container, so they qualify. [`preload_table`]
+/// and [`open_table`] decorate this one root store with each table's own prefix instead of
+/// re-resolving a client per table.
+///
+/// A local path or a `/Volumes/...` FUSE mount has no such client to share, so this makes
+/// no difference there; it matters for `abfss://`, `s3://` and `gs://` targets.
+#[derive(Clone)]
+pub struct SharedStore {
+    store: Arc<dyn ObjectStore>,
+}
+
+impl SharedStore {
+    /// Resolves the object store for `prefix`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Delta`] for a storage or protocol failure while resolving the backend.
+    ///
+    /// # Panics
+    ///
+    /// Does not panic.
+    ///
+    /// # Blocking
+    ///
+    /// Synchronous: resolving a backend client is local work, not a storage round trip.
+    pub fn resolve(prefix: &str, storage_options: &HashMap<String, String>) -> Result<Self> {
+        let url = ensure_table_uri(prefix).map_err(delta)?;
+        let logstore = DeltaTableBuilder::from_url(url)
+            .map_err(delta)?
+            .with_storage_options(storage_options.clone())
+            .build_storage()
+            .map_err(delta)?;
+        Ok(Self {
+            store: logstore.root_object_store(None),
+        })
+    }
+}
+
+/// Checks whether the Delta table for `table_name` beneath `prefix` exists, and loads its
+/// current schema if so, without touching the incoming schema at all.
+///
+/// This is the network-bound half of opening a table: reading its `_delta_log`, if one
+/// exists. It carries no dependency on the dump's `COPY` column order, so it can run as
+/// soon as a table's `CREATE TABLE` has been parsed, overlapping its storage round trip
+/// with whatever table is currently being decoded rather than serialising it on the
+/// reader thread right as the `COPY` block starts. Pair with [`finish_open`], which needs
+/// the schema and therefore cannot run until the `COPY` header has been read.
+///
+/// `shared_store` is decorated with this table's own path rather than rebuilt; see
+/// [`SharedStore`].
+///
+/// For a local path or a `/Volumes/...` FUSE mount, this creates the table's directory
+/// (delta-rs's `ensure_table_uri` does that eagerly, to canonicalise it) even though no
+/// Delta table exists there yet: the directory carries no `_delta_log` and is not a
+/// readable Delta table until [`finish_open`] runs. Calling this well ahead of a table's
+/// `COPY` block, which is the point of it, means that empty directory can now appear for
+/// every wanted table before the load has gotten anywhere near it, including one whose
+/// `COPY` block is never reached because the load fails or is interrupted first. Object
+/// storage backends have no such directory to pre-create and are unaffected.
+///
+/// # Errors
+///
+/// [`Error::UnsafeTableName`] if the name would escape the prefix, and [`Error::Delta`]
+/// for a storage or protocol failure.
+///
+/// # Panics
+///
+/// Does not panic.
+pub async fn preload_table(
+    prefix: &str,
+    table_name: &TableName,
+    shared_store: &SharedStore,
+    storage_options: &HashMap<String, String>,
+) -> Result<PreloadedTable> {
+    let uri = table_uri(prefix, table_name)?;
+    let url = ensure_table_uri(&uri).map_err(delta)?;
+    let mut table = DeltaTableBuilder::from_url(url.clone())
+        .map_err(delta)?
+        .with_storage_options(storage_options.clone())
+        .with_storage_backend(shared_store.store.clone(), url)
+        .build()
+        .map_err(delta)?;
+
+    // `load` fails when no log exists yet, which is how a first run is detected.
+    let existing_schema = if table.load().await.is_ok() {
+        let snapshot = table.snapshot().map_err(delta)?;
+        Some(snapshot.schema().as_ref().clone())
+    } else {
+        None
+    };
+
+    Ok(PreloadedTable {
+        table,
+        uri,
+        existing_schema,
+    })
+}
+
+/// Finishes opening a [`PreloadedTable`] once the dump's exact, `COPY`-ordered schema for
+/// it is known: creates the table on a first run, or diffs the incoming schema against
+/// what [`preload_table`] already read.
 ///
 /// The incoming `schema` is compared against the table's current one and the difference is
 /// returned. Under [`WriteMode::Overwrite`] a difference is legal and is applied by
 /// [`commit_table`]; under [`WriteMode::Append`] it is refused, because appending rows
 /// shaped one way to a table declared another way cannot be made to mean anything.
+///
+/// # Errors
+///
+/// [`Error::TableExists`] if `mode` is [`WriteMode::ErrorIfExists`] and the table already
+/// holds data, [`Error::SchemaChanged`] if `mode` is [`WriteMode::Append`] and the schema
+/// differs, and [`Error::Delta`] for a storage or protocol failure.
+///
+/// # Panics
+///
+/// Does not panic.
+pub async fn finish_open(
+    preloaded: PreloadedTable,
+    table_name: &TableName,
+    schema: &ArrowSchema,
+    mode: WriteMode,
+) -> Result<OpenedTable> {
+    let PreloadedTable {
+        mut table,
+        uri,
+        existing_schema,
+    } = preloaded;
+
+    let Some(current_schema) = existing_schema else {
+        let kernel: StructType = schema.try_into_kernel().map_err(delta)?;
+        let columns = kernel.fields().cloned().collect::<Vec<_>>();
+        table = table
+            .create()
+            .with_columns(columns)
+            .with_save_mode(SaveMode::ErrorIfExists)
+            .await
+            .map_err(delta)?;
+        return Ok(OpenedTable {
+            table,
+            uri,
+            drift: SchemaDrift::default(),
+        });
+    };
+
+    if mode == WriteMode::ErrorIfExists && !current_files(&table).await?.is_empty() {
+        return Err(Error::TableExists {
+            table: table_name.qualified(),
+        });
+    }
+
+    let drift = {
+        let incoming: StructType = schema.try_into_kernel().map_err(delta)?;
+        diff_schema(&current_schema, &incoming)
+    };
+    if !drift.is_empty() && mode == WriteMode::Append {
+        return Err(Error::SchemaChanged {
+            table: table_name.qualified(),
+            detail: drift.summary(),
+        });
+    }
+
+    Ok(OpenedTable { table, uri, drift })
+}
+
+/// Opens the Delta table for `table_name` beneath `prefix`, creating it on a first run.
+///
+/// The returned table is loaded and ready for a [`TableWriter`].
+///
+/// A convenience composition of [`preload_table`] and [`finish_open`] for a caller with no
+/// reason to start the two apart, such as [`TableSink::open`]. The parallel pipeline calls
+/// them separately so a table's network-bound existence check can run well ahead of the
+/// `COPY` block that supplies the schema [`finish_open`] needs; see their docs.
 ///
 /// # Errors
 ///
@@ -346,50 +532,11 @@ pub async fn open_table(
     mode: WriteMode,
     storage_options: &HashMap<String, String>,
 ) -> Result<OpenedTable> {
-    let uri = table_uri(prefix, table_name)?;
-    let url = ensure_table_uri(&uri).map_err(delta)?;
-    let mut table = DeltaTableBuilder::from_url(url)
-        .map_err(delta)?
-        .with_storage_options(storage_options.clone())
-        .build()
-        .map_err(delta)?;
-
-    // `load` fails when no log exists yet, which is how a first run is detected.
-    if table.load().await.is_err() {
-        let kernel: StructType = schema.try_into_kernel().map_err(delta)?;
-        let columns = kernel.fields().cloned().collect::<Vec<_>>();
-        table = table
-            .create()
-            .with_columns(columns)
-            .with_save_mode(SaveMode::ErrorIfExists)
-            .await
-            .map_err(delta)?;
-        return Ok(OpenedTable {
-            table,
-            uri,
-            drift: SchemaDrift::default(),
-        });
-    }
-
-    if mode == WriteMode::ErrorIfExists && !current_files(&table).await?.is_empty() {
-        return Err(Error::TableExists {
-            table: table_name.qualified(),
-        });
-    }
-
-    let drift = {
-        let incoming: StructType = schema.try_into_kernel().map_err(delta)?;
-        let snapshot = table.snapshot().map_err(delta)?;
-        diff_schema(snapshot.schema().as_ref(), &incoming)
-    };
-    if !drift.is_empty() && mode == WriteMode::Append {
-        return Err(Error::SchemaChanged {
-            table: table_name.qualified(),
-            detail: drift.summary(),
-        });
-    }
-
-    Ok(OpenedTable { table, uri, drift })
+    // A one-off resolve: this convenience wrapper is for a caller opening a single table
+    // (the manifest table, or a test), where there is nothing else to share the store with.
+    let shared_store = SharedStore::resolve(prefix, storage_options)?;
+    let preloaded = preload_table(prefix, table_name, &shared_store, storage_options).await?;
+    finish_open(preloaded, table_name, schema, mode).await
 }
 
 /// Commits `staged` against `table`, making its new contents visible in one Delta version.
