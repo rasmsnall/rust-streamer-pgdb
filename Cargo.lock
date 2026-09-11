@@ -2548,6 +2548,7 @@ checksum = "3637c05577168127568a64e9dc5a6887da720efef07b3d9472d45f63ab191166"
 name = "pgdelta"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "deltalake",
  "flate2",

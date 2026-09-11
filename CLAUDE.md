@@ -423,6 +423,20 @@ Resolved and shipped:
     public.
   - Verified only on local-filesystem storage in this environment; the code path for
     `abfss://`/`s3://`/`gs://` is unverified against a real backend.
+- Fixed a real bug surfaced by an Azure run: the resume path in `source.rs` could ask for
+  a byte range starting exactly at the object's own length, which Azure correctly refuses
+  with `416 Range Not Satisfiable`. Cause: a backend can surface a connection-level error
+  right at the tail of an otherwise-complete response instead of a clean stream end;
+  `ObjectSource::next_chunk` treated every stream error as a break and resumed from
+  `delivered`, without checking whether `delivered` had already reached `total`. A load
+  that had actually finished would then fail after burning through `MAX_RESUMES` retries,
+  each hitting the same unsatisfiable range. Fixed by checking `delivered >= total` before
+  resuming and treating that case as completion, matching how the loop's normal
+  end-of-stream arm already behaves. Regression-tested with a hand-rolled `ObjectStore`
+  wrapping `object_store::memory::InMemory` whose first `get_opts` answers with all bytes
+  followed by a stream error instead of a clean end; confirmed it fails without the fix
+  (`InvalidGetRange::StartTooLarge`, the client-side analogue of Azure's 416) and passes
+  with it.
 - Re-run story: `overwrite` is idempotent and a failed run commits nothing, so the
   recovery procedure is to run it again. Documented in `docs/operations.md`, Chapter V.
 - `VACUUM` guidance and a per-table loop are in `docs/operations.md`, Chapter IV.

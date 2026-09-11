@@ -46,6 +46,9 @@ url = "2.5"
 [dev-dependencies]
 # Integration tests read parquet off disk to check what the log made visible.
 bytes = "1.12.1"
+# Already compiled as part of the object_store tree. Needed to implement its
+# `#[async_trait]`-declared `ObjectStore` trait for a test double in src/source.rs.
+async-trait = "0.1.92"
 
 [features]
 default = []

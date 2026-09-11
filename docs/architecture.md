@@ -215,6 +215,13 @@ stream is resumed with a ranged GET from the offset already delivered. A stream 
 short of the object's stated length fails the load, because a short read here would look
 exactly like a truncated dump and be blamed on the sender.
 
+An error is not always a break, though: a backend can surface a connection-level hiccup
+right at the tail of an otherwise-complete response instead of ending the stream cleanly.
+Resuming that as if it were a break asks for a range starting at or past the object's
+length, which every store correctly refuses (Azure: `416 Range Not Satisfiable`). That
+case is distinguished from a real break by comparing bytes delivered against the object's
+stated length, and treated as a completed transfer rather than retried.
+
 Because the source is a delivered file rather than a spawned process, this module
 contains no subprocess handling and no connection strings. Credentials, when a cloud
 source needs them, arrive in `storage_options` and are never logged.

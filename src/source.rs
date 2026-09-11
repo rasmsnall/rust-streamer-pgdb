@@ -25,6 +25,14 @@
 //! short. A stream that ends early against a known content length is treated as a
 //! truncated transfer and fails, because a short read here would look exactly like a
 //! truncated dump and be blamed on the sender.
+//!
+//! An error can also arrive after every byte has already been delivered: some backends
+//! surface a connection-level hiccup at the very end of a response instead of a clean
+//! stream end. That is not a broken transfer, it is a finished one, and is treated as
+//! such rather than resumed: a resume from that offset would ask for a range starting at
+//! or past the object's length, which every store correctly refuses (Azure: 416 Range Not
+//! Satisfiable), turning a load that actually completed into one that fails after
+//! exhausting every retry.
 
 use std::collections::HashMap;
 use std::io::{self, Read};
@@ -223,6 +231,19 @@ impl ObjectSource {
                     return Ok(Some(bytes));
                 }
                 Some(Err(err)) => {
+                    // The stream can surface a connection-level error right at its tail
+                    // instead of a clean end, once every byte has already arrived. A
+                    // resume from here would ask for a range starting at or past the
+                    // object's length, which every store rejects (Azure: 416 Range Not
+                    // Satisfiable; object_store itself refuses it client-side via
+                    // `GetRange::Offset`). Left uncaught, that turns a transfer that
+                    // actually finished into a failure that burns through every retry.
+                    // A completed transfer is exactly what the loop's `None` arm already
+                    // treats as success, so this joins it there.
+                    if self.delivered >= self.total {
+                        self.stream = None;
+                        return Ok(None);
+                    }
                     if self.resumes >= MAX_RESUMES {
                         return Err(io::Error::other(format!(
                             "reading {} failed after {} resumes at byte {} of {}: {err}",
@@ -271,6 +292,146 @@ impl Read for ObjectSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use object_store::memory::InMemory;
+    use object_store::{
+        CopyOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions,
+        PutOptions, PutPayload, PutResult, Result as OSResult,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    /// Delegates every operation to an in-memory store, except that its first `get_opts`
+    /// answers with all of the object's bytes followed by a stream error instead of a
+    /// clean end. Reproduces a backend surfacing a connection-level hiccup at the very
+    /// tail of an otherwise-complete response, which is what [`ObjectSource::next_chunk`]
+    /// must treat as a finished transfer rather than a broken one.
+    #[derive(Debug)]
+    struct FlakyAtEof {
+        inner: InMemory,
+        gets: AtomicUsize,
+    }
+
+    impl std::fmt::Display for FlakyAtEof {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FlakyAtEof({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for FlakyAtEof {
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> OSResult<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            opts: PutMultipartOptions,
+        ) -> OSResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            options: GetOptions,
+        ) -> OSResult<GetResult> {
+            if self.gets.fetch_add(1, AtomicOrdering::SeqCst) > 0 {
+                return self.inner.get_opts(location, options).await;
+            }
+            // First call: pull the real bytes, then hand back a stream that yields them
+            // and then errors, instead of ending cleanly.
+            let real = self.inner.get_opts(location, options).await?;
+            let meta = real.meta.clone();
+            let range = real.range.clone();
+            let attributes = real.attributes.clone();
+            let bytes = real.bytes().await?;
+            let broken = futures::stream::iter([
+                Ok(bytes),
+                Err(object_store::Error::Generic {
+                    store: "FlakyAtEof",
+                    source: "connection reset right at the tail".into(),
+                }),
+            ]);
+            Ok(GetResult {
+                payload: object_store::GetResultPayload::Stream(Box::pin(broken)),
+                meta,
+                range,
+                attributes,
+            })
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, OSResult<ObjectPath>>,
+        ) -> BoxStream<'static, OSResult<ObjectPath>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(&self, prefix: Option<&ObjectPath>) -> BoxStream<'static, OSResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&ObjectPath>) -> OSResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+            options: CopyOptions,
+        ) -> OSResult<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// A stream error that arrives only after every byte has already been delivered must
+    /// be treated as a completed transfer, not a broken one: resuming would ask for a
+    /// range starting at or past the object's length, which every store refuses (Azure:
+    /// 416 Range Not Satisfiable).
+    #[test]
+    fn a_stream_error_after_every_byte_has_arrived_is_not_a_truncation() {
+        let handle_owner = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let handle = handle_owner.handle().clone();
+        let _guard = handle_owner.enter();
+
+        let inner = InMemory::new();
+        let path = ObjectPath::from("day.sql");
+        let content = Bytes::from_static(b"CREATE TABLE public.t (id integer);\n");
+        handle
+            .block_on(inner.put(&path, content.clone().into()))
+            .unwrap();
+
+        let store: std::sync::Arc<dyn ObjectStore> = std::sync::Arc::new(FlakyAtEof {
+            inner,
+            gets: AtomicUsize::new(0),
+        });
+
+        let mut source = ObjectSource::start(
+            handle,
+            store,
+            path,
+            content.len() as u64,
+            "memory://day.sql".to_string(),
+        )
+        .unwrap();
+
+        let mut got = Vec::new();
+        source.read_to_end(&mut got).unwrap();
+        assert_eq!(got, content.to_vec());
+        assert_eq!(
+            source.resumes, 0,
+            "a completed transfer must not count as a resume"
+        );
+    }
 
     #[test]
     fn remote_schemes_are_recognised() {
