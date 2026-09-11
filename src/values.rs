@@ -143,11 +143,17 @@ pub fn parse_bool(v: &[u8], column: &str) -> Result<Option<bool>> {
 /// the surplus digits are all zero. Silently discarding significant digits would change
 /// stored values without saying so.
 ///
+/// A value whose magnitude needs more than `precision` significant digits is rejected
+/// too. Arrow's `Decimal128Array` never checks this itself (`Decimal128Builder::finish`
+/// stores whatever unscaled integer it was given, however many digits it has), so this is
+/// the only place that stands between an oversized value and a `decimal(p,s)` column
+/// silently holding a number that column cannot actually represent.
+///
 /// # Errors
 ///
-/// [`Error::UnparsableValue`] if the text is not a decimal, carries an exponent, or
-/// would lose significant precision.
-pub fn parse_decimal(v: &[u8], scale: i8, column: &str) -> Result<Option<i128>> {
+/// [`Error::UnparsableValue`] if the text is not a decimal, carries an exponent, would
+/// lose significant precision, or has more significant digits than `precision` allows.
+pub fn parse_decimal(v: &[u8], precision: u8, scale: i8, column: &str) -> Result<Option<i128>> {
     let s = text(v, column, "numeric")?.trim();
     if s == "NaN" {
         return Ok(None);
@@ -196,6 +202,11 @@ pub fn parse_decimal(v: &[u8], scale: i8, column: &str) -> Result<Option<i128>> 
         unscaled = unscaled
             .checked_mul(10)
             .ok_or_else(|| bad(column, "numeric"))?;
+    }
+    // `precision` is at most 38, so this power always fits an i128.
+    let limit = 10_i128.pow(u32::from(precision));
+    if unscaled >= limit {
+        return Err(bad(column, "numeric"));
     }
     Ok(Some(if negative { -unscaled } else { unscaled }))
 }
@@ -491,26 +502,40 @@ mod tests {
 
     #[test]
     fn decimals_scale_correctly() {
-        assert_eq!(parse_decimal(b"123.45", 2, C).unwrap(), Some(12345));
-        assert_eq!(parse_decimal(b"-123.45", 2, C).unwrap(), Some(-12345));
-        assert_eq!(parse_decimal(b"7", 2, C).unwrap(), Some(700));
-        assert_eq!(parse_decimal(b"0.5", 3, C).unwrap(), Some(500));
-        assert_eq!(parse_decimal(b"123", 0, C).unwrap(), Some(123));
+        assert_eq!(parse_decimal(b"123.45", 38, 2, C).unwrap(), Some(12345));
+        assert_eq!(parse_decimal(b"-123.45", 38, 2, C).unwrap(), Some(-12345));
+        assert_eq!(parse_decimal(b"7", 38, 2, C).unwrap(), Some(700));
+        assert_eq!(parse_decimal(b"0.5", 38, 3, C).unwrap(), Some(500));
+        assert_eq!(parse_decimal(b"123", 38, 0, C).unwrap(), Some(123));
     }
 
     #[test]
     fn decimal_nan_becomes_null_not_an_error() {
-        assert_eq!(parse_decimal(b"NaN", 2, C).unwrap(), None);
+        assert_eq!(parse_decimal(b"NaN", 38, 2, C).unwrap(), None);
     }
 
     #[test]
     fn decimal_refuses_to_lose_significant_digits() {
         // Trailing zeros beyond the scale are harmless.
-        assert_eq!(parse_decimal(b"1.2300", 2, C).unwrap(), Some(123));
+        assert_eq!(parse_decimal(b"1.2300", 38, 2, C).unwrap(), Some(123));
         // Real digits beyond the scale are not.
-        assert!(parse_decimal(b"1.239", 2, C).is_err());
-        assert!(parse_decimal(b"1e5", 2, C).is_err());
-        assert!(parse_decimal(b"abc", 2, C).is_err());
+        assert!(parse_decimal(b"1.239", 38, 2, C).is_err());
+        assert!(parse_decimal(b"1e5", 38, 2, C).is_err());
+        assert!(parse_decimal(b"abc", 38, 2, C).is_err());
+    }
+
+    /// `Decimal128Builder` never validates this itself (`finish` stores whatever unscaled
+    /// integer it was given), so `parse_decimal` is the only thing standing between an
+    /// oversized value and a `decimal(p,s)` column silently holding a number that column
+    /// cannot represent.
+    #[test]
+    fn decimal_refuses_a_value_wider_than_its_precision() {
+        // numeric(5,2): up to 3 integer digits. 999.99 fits; 1000.00 does not.
+        assert_eq!(parse_decimal(b"999.99", 5, 2, C).unwrap(), Some(99999));
+        assert!(parse_decimal(b"1000.00", 5, 2, C).is_err());
+        // The boundary at precision 38 (decimal(38,18)'s widest representable value).
+        assert!(parse_decimal(b"99999999999999999999.999999999999999999", 38, 18, C).is_ok());
+        assert!(parse_decimal(b"100000000000000000000.000000000000000000", 38, 18, C).is_err());
     }
 
     #[test]

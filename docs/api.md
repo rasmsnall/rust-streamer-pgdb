@@ -118,6 +118,7 @@ report = pgdelta.stream_dump_to_delta(
     *,
     tables=None,
     excluded_schemas=None,
+    wide_numeric_as_decimal=False,
     mode="overwrite",
     batch_rows=100_000,
     batch_bytes=134_217_728,
@@ -167,6 +168,7 @@ which is idempotent in `overwrite` mode. See `architecture.md`, Chapter VI, Sect
 | `output_uri` | `str` | required | Prefix every table is written beneath |
 | `tables` | `list[str]` or `None` | `None` | Qualified names to load. `None` loads every table in the dump |
 | `excluded_schemas` | `list[str]` or `None` | `None` | PostgreSQL schema (namespace) names to exclude entirely. See Chapter V, Section 2 |
+| `wide_numeric_as_decimal` | `bool` | `False` | Map a too-wide `numeric` to `decimal(38,18)` instead of text. See Chapter V, Section 5 |
 | `mode` | `str` | `"overwrite"` | `"overwrite"`, `"append"` or `"error"`. See Chapter V, Section 1 |
 | `batch_rows` | `int` | `100_000` | Row ceiling for one in-memory Arrow batch |
 | `batch_bytes` | `int` | `128 << 20` | Byte ceiling for one in-memory Arrow batch, on decoded field bytes |
@@ -534,6 +536,17 @@ its own DDL, and that is not a fidelity question. Likewise a text column carryin
 that are not valid UTF-8 fails, because Arrow strings are UTF-8 and substituting
 replacement characters would corrupt values silently.
 
+`wide_numeric_as_decimal` moves a `numeric` with no natural bound (unconstrained, or a
+declared precision over 38) from that first bucket into something closer to the second.
+Off, which is the default, it is type uncertainty: the column degrades to `Utf8` and the
+load proceeds. On, the column is mapped to `decimal(38,18)` instead, and from that point
+a value too wide for it (more than 20 integer digits, or more than 18 significant
+fractional ones) is a structural disagreement with the type this column now has, and
+fails the load rather than being silently truncated or wrapped. A `numeric(p,s)` with
+`p <= 38` whose *scale* Arrow cannot represent (negative, or exceeding `p`) is a
+different, narrower declaration problem and keeps degrading to `Utf8` regardless of this
+flag.
+
 The full mapping is `architecture.md`, Chapter VIII.
 
 ### 6. Schema drift
@@ -703,6 +716,7 @@ async context will deadlock.
 | `mode="error"` | A one-off backfill that must not clobber an existing table |
 | `tables` | You need a subset. Skipping a block is nearly free |
 | `excluded_schemas` | You never want an entire schema, especially one whose DDL this library might not parse |
+| `wide_numeric_as_decimal` | The target is Databricks and an unconstrained `numeric` should be a real decimal, not text |
 | `threads` | The driver is shared, or memory is tight. Otherwise leave it |
 | `batch_bytes` | Memory is tight. Lower this before lowering `threads` |
 | `storage_options` | Output is `abfss://` or another authenticated backend |

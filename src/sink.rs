@@ -781,7 +781,7 @@ impl TableSink {
 mod tests {
     use super::*;
     use deltalake::arrow::array::{Int32Array, StringArray};
-    use deltalake::arrow::datatypes::{DataType, Field};
+    use deltalake::arrow::datatypes::{DataType, Field, TimeUnit};
     use std::sync::Arc;
 
     fn schema() -> ArrowSchema {
@@ -922,6 +922,58 @@ mod tests {
             sink.commit().await.unwrap();
             reader.load().await.unwrap();
             assert_eq!(reader.version(), Some(1), "commit must publish one version");
+        });
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An Arrow `Timestamp` with no timezone is delta-rs's own signal for `timestamp_ntz`,
+    /// which needs reader v3 / writer v7. A naive PostgreSQL `timestamp without time
+    /// zone`, assumed UTC, must be stamped with a timezone in its Arrow type (see
+    /// `builders::UTC`) precisely so it lands as Delta's plain `timestamp` and this floor
+    /// holds, or every table with the most common PostgreSQL timestamp type would silently
+    /// require a newer Databricks runtime than this library documents supporting.
+    #[test]
+    fn a_naive_timestamp_column_still_sits_at_the_compatibility_floor() {
+        let dir = std::env::temp_dir().join(format!("pgdelta-proto-ts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let naive_timestamp_schema = ArrowSchema::new(vec![Field::new(
+            "made",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            true,
+        )]);
+
+        rt().block_on(async {
+            let mut sink = TableSink::open(
+                &prefix(&dir),
+                &bare("t"),
+                &naive_timestamp_schema,
+                WriteMode::Append,
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+            sink.stage().await.unwrap();
+            sink.commit().await.unwrap();
+
+            let protocol = sink.table.snapshot().unwrap().protocol();
+            assert_eq!(
+                protocol.min_reader_version(),
+                1,
+                "a naive timestamp column must not raise the reader floor"
+            );
+            assert_eq!(
+                protocol.min_writer_version(),
+                2,
+                "a naive timestamp column must not raise the writer floor"
+            );
+            let schema_json = format!("{:?}", sink.table.snapshot().unwrap().schema());
+            assert!(
+                !schema_json.contains("timestamp_ntz") && !schema_json.contains("TimestampNtz"),
+                "the committed schema must not declare timestamp_ntz: {schema_json}"
+            );
         });
 
         let _ = std::fs::remove_dir_all(&dir);

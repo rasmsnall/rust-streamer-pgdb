@@ -109,6 +109,25 @@ pub struct LoadConfig {
     /// Applies even to a table also named in `tables`: exclusion wins, since it states
     /// the stronger intent of never touching that schema at all.
     pub excluded_schemas: Option<Vec<String>>,
+    /// Map a too-wide `numeric` to `decimal(38,18)` instead of the default text fallback.
+    ///
+    /// "Too wide" means a bare, unconstrained `numeric`, or one declared with a precision
+    /// over 38: see [`crate::types::numeric_too_wide`]. `decimal(38,18)` is the
+    /// conventional choice for numeric data with no natural bound on a Databricks target.
+    ///
+    /// A value that does not fit even `decimal(38,18)` (more than 20 integer digits, or
+    /// more than 18 significant fractional ones) fails the load: it is a structural
+    /// disagreement between the data and the type this column has been mapped to, the
+    /// same as any other row that contradicts its declared shape, not type uncertainty
+    /// to degrade quietly.
+    ///
+    /// A `numeric(p,s)` with `p <= 38` and a scale Arrow cannot represent (negative, or
+    /// exceeding `p`) is unaffected by this flag and keeps falling back to text: that is
+    /// a different declaration problem than "no natural bound", and reinterpreting its
+    /// scale as 18 would silently change what the column means.
+    ///
+    /// `false` by default, so an existing caller sees no change until it opts in.
+    pub wide_numeric_as_decimal: bool,
     /// How an existing Delta table is treated. See [`WriteMode`].
     pub mode: WriteMode,
     /// Row ceiling for one in-memory Arrow batch.
@@ -158,6 +177,7 @@ impl Default for LoadConfig {
             output_uri: String::new(),
             tables: None,
             excluded_schemas: None,
+            wide_numeric_as_decimal: false,
             mode: WriteMode::Overwrite,
             batch_rows: 100_000,
             batch_bytes: 128 << 20,
@@ -301,6 +321,7 @@ struct BlockCtx {
     limits: Limits,
     batch_rows: usize,
     batch_bytes: usize,
+    wide_numeric_as_decimal: bool,
 }
 
 /// A unit of work for a decode worker.
@@ -787,7 +808,10 @@ where
                     let resolved = resolve_copy_columns(def, &columns)?;
                     let pairs: Vec<(String, ResolvedType)> =
                         columns.iter().cloned().zip(resolved).collect();
-                    let schema: ArrowSchemaRef = Arc::new(builders::arrow_schema(&pairs));
+                    let schema: ArrowSchemaRef = Arc::new(builders::arrow_schema(
+                        &pairs,
+                        config.wide_numeric_as_decimal,
+                    ));
                     // Almost always already resolved, or close to it: its preload was
                     // started back when this table's CREATE TABLE was parsed, which is
                     // necessarily before any COPY block in the dump. Falling back to an
@@ -827,6 +851,7 @@ where
                         limits: config.limits,
                         batch_rows: config.batch_rows,
                         batch_bytes: config.batch_bytes,
+                        wide_numeric_as_decimal: config.wide_numeric_as_decimal,
                     });
                     for tx in job_tx {
                         dispatch(tx, Job::Open(Arc::clone(&ctx)), event_rx)?;
@@ -1130,7 +1155,12 @@ fn worker_loop(
                 let block = match blocks.entry(generation) {
                     std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                     std::collections::hash_map::Entry::Vacant(e) => e.insert(WorkerBlock {
-                        builder: BatchBuilder::new(&ctx.columns, ctx.batch_rows, ctx.batch_bytes),
+                        builder: BatchBuilder::new(
+                            &ctx.columns,
+                            ctx.batch_rows,
+                            ctx.batch_bytes,
+                            ctx.wide_numeric_as_decimal,
+                        ),
                         writer: TableWriter::new(
                             &ctx.uri,
                             Arc::clone(&ctx.schema),

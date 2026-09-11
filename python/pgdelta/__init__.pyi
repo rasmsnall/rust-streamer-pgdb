@@ -148,6 +148,7 @@ def stream_dump_to_delta(
     *,
     tables: Sequence[str] | None = ...,
     excluded_schemas: Sequence[str] | None = ...,
+    wide_numeric_as_decimal: bool = ...,
     mode: Literal["overwrite", "append", "error"] = ...,
     batch_rows: int = ...,
     batch_bytes: int = ...,
@@ -198,6 +199,15 @@ def stream_dump_to_delta(
         library recognises just enough to find where the statement ends, so a DDL
         construct it cannot parse, inside a schema you do not want, can never fail the
         load. Applies even to a table also named in ``tables``: exclusion wins.
+    wide_numeric_as_decimal:
+        Map a bare, unconstrained ``numeric`` or one declared with precision over 38 to
+        ``decimal(38,18)`` instead of the default text fallback. ``decimal(38,18)`` is the
+        conventional choice for numeric data with no natural bound on a Databricks target.
+        A value that does not fit even that (more than 20 integer digits, or more than 18
+        significant fractional ones) fails the load, the same as any other row that
+        contradicts its declared shape. A ``numeric(p,s)`` with ``p <= 38`` and a scale
+        Arrow cannot represent (negative, or exceeding ``p``) is unaffected and keeps
+        falling back to text regardless. ``False`` by default.
     mode:
         ``"overwrite"`` tombstones the previous run's files in the same commit that adds
         the new ones. ``"append"`` adds to what is there. ``"error"`` fails if the target

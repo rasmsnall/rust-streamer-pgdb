@@ -243,6 +243,15 @@ fn parse_mode(mode: &str) -> PyResult<WriteMode> {
 ///     left out of ``tables``, but its ``CREATE TABLE`` is also never fully parsed, so a
 ///     DDL construct this library cannot parse in a schema you do not want can never fail
 ///     the load. Applies even to a table also named in ``tables``: exclusion wins.
+/// wide_numeric_as_decimal : bool
+///     Map a bare, unconstrained ``numeric`` or one declared with precision over 38 to
+///     ``decimal(38,18)`` instead of the default text fallback. ``decimal(38,18)`` is the
+///     conventional choice for numeric data with no natural bound on a Databricks target.
+///     A value that does not fit even that (more than 20 integer digits, or more than 18
+///     significant fractional ones) fails the load, the same as any other row that
+///     contradicts its declared shape. A ``numeric(p,s)`` with ``p <= 38`` and a scale
+///     Arrow cannot represent (negative, or exceeding ``p``) is unaffected and keeps
+///     falling back to text regardless. ``False`` by default.
 /// mode : str
 ///     ``"overwrite"``, ``"append"`` or ``"error"``. Overwrite tombstones the previous
 ///     run's files in the same commit that adds the new ones.
@@ -329,6 +338,7 @@ fn parse_mode(mode: &str) -> PyResult<WriteMode> {
     *,
     tables = None,
     excluded_schemas = None,
+    wide_numeric_as_decimal = false,
     mode = "overwrite",
     batch_rows = 100_000,
     batch_bytes = 128 << 20,
@@ -350,6 +360,7 @@ fn stream_dump_to_delta(
     output_uri: String,
     tables: Option<Vec<String>>,
     excluded_schemas: Option<Vec<String>>,
+    wide_numeric_as_decimal: bool,
     mode: &str,
     batch_rows: usize,
     batch_bytes: usize,
@@ -380,6 +391,7 @@ fn stream_dump_to_delta(
         output_uri,
         tables,
         excluded_schemas,
+        wide_numeric_as_decimal,
         mode: parse_mode(mode)?,
         batch_rows,
         batch_bytes,

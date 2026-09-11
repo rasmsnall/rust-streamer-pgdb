@@ -604,10 +604,11 @@ than if.
 | `real` | `Float32` |
 | `double precision` | `Float64` |
 | `numeric(p,s)` where 1 <= p <= 38 and 0 <= s <= p | `Decimal128(p,s)` |
-| `numeric` unconstrained, or outside that range | `Utf8` |
+| `numeric` unconstrained, or with p > 38 | `Utf8`, or `Decimal128(38,18)` opted into with `wide_numeric_as_decimal` |
+| `numeric(p,s)` with p <= 38 but s outside `0 <= s <= p` | `Utf8`, always |
 | `boolean` | `Boolean` |
 | `date` | `Date32` |
-| `timestamp` | `Timestamp(Micros, None)` |
+| `timestamp` | `Timestamp(Micros, UTC)`, assumed UTC (§4) |
 | `timestamptz` | `Timestamp(Micros, UTC)` |
 | `time` | `Time64(Micros)` |
 | `bytea` | `Binary` |
@@ -617,6 +618,12 @@ than if.
 Arrays and `interval` are retained as their unescaped PostgreSQL literal. This is honest:
 it avoids guessing at a structure the caller may not want, and the text remains
 convertible downstream.
+
+`timestamp` is stamped with the `UTC` timezone in its Arrow type regardless of whether
+the source carried one. An Arrow `Timestamp` with *no* timezone at all is delta-rs's own
+signal for Delta's `timestamp_ntz`, which needs reader v3 / writer v7 and would break the
+compatibility floor established in Chapter X, for the single most common PostgreSQL
+timestamp type. See Section 4.
 
 ### 2. Edge cases
 
@@ -655,6 +662,18 @@ the operator address the source encoding, which is the real problem.
 
 A value that contradicts its declared type, such as text in an integer column, also fails
 the load. That is structural: the dump disagrees with its own DDL.
+
+`LoadConfig::wide_numeric_as_decimal` moves the unconstrained-or-over-38-precision case
+out of the "degrade to text" bucket and into `Decimal128(38,18)` instead, for a caller
+targeting Databricks who wants a real decimal rather than a string. Once that mapping
+applies, a value too wide for it is no longer type uncertainty: it is a structural
+disagreement with the type the column now has, exactly like text in an integer column,
+and fails the load rather than being silently truncated or wrapped. `Decimal128Builder`
+does not check this itself (it stores whatever unscaled integer it is given, however many
+digits), so the check happens in `values::parse_decimal` before the value ever reaches the
+builder. The negative-or-over-precision scale case above is unaffected by this flag: it
+stays text, because reinterpreting its declared scale as 18 would change what the column
+means without saying so.
 
 ### 3. Schema changes between runs
 

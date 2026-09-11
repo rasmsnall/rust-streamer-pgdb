@@ -236,10 +236,10 @@ These are requirements, not suggestions. They were the starting point of the des
 | `real` | `Float32` |
 | `double precision` | `Float64` |
 | `numeric(p,s)`, p<=38 | `Decimal128(p,s)` |
-| `numeric` unconstrained / p>38 | `Utf8` |
+| `numeric` unconstrained / p>38 | `Utf8`, or `Decimal128(38,18)` with `wide_numeric_as_decimal` |
 | `boolean` | `Boolean` |
 | `date` | `Date32` |
-| `timestamp` | `Timestamp(Micros, None)` |
+| `timestamp` | `Timestamp(Micros, UTC)`, assumed UTC (see below) |
 | `timestamptz` | `Timestamp(Micros, UTC)` |
 | `time` | `Time64(Micros)` |
 | `bytea` | `Binary` (decode `\x` hex; fall back to escape format) |
@@ -271,6 +271,7 @@ pgdelta.stream_dump_to_delta(
     dump_path=...,          # file, or a file descriptor / readable stream
     tables=["public.users"],
     excluded_schemas=["audit", "staging"],
+    wide_numeric_as_decimal=True,
     output_uri="/Volumes/main/raw/pg/",
     mode="overwrite" | "append" | "error",
     batch_rows=100_000,
@@ -437,6 +438,38 @@ Resolved and shipped:
   followed by a stream error instead of a clean end; confirmed it fails without the fix
   (`InvalidGetRange::StartTooLarge`, the client-side analogue of Azure's 416) and passes
   with it.
+- Fixed a real bug found while extending Databricks compatibility: `timestamp without
+  time zone` was declared in the Arrow schema as `Timestamp(Micros, None)`, a bare Arrow
+  timestamp with no timezone at all. delta-rs's own convention treats that as *naive* and
+  maps it straight to Delta's `timestamp_ntz` (reader v3 / writer v7), silently breaking
+  the "any DBR version can read the result" floor this library had already documented as
+  a requirement, for the single most common PostgreSQL timestamp type. `timestamptz` was
+  unaffected, since it already carried an explicit `UTC` timezone. Confirmed empirically
+  (a throwaway load whose committed `_delta_log` JSON showed `"type":"timestamp_ntz"` and
+  `readerFeatures:["timestampNtz"]`) before fixing, not just reasoned about. Fixed by
+  stamping `UTC` on both variants' Arrow type (`builders::UTC`) and on the array `finish()`
+  produces, since a naive PostgreSQL timestamp is already documented and assumed to mean
+  UTC; the only remaining difference between the two is at value-parsing time
+  (`timestamptz` strips a source offset, `timestamp` does not). Regression-tested in
+  `sink.rs` by committing a table with a naive-timestamp-shaped column and asserting the
+  protocol stays at reader v1 / writer v2 and the schema JSON never mentions
+  `timestamp_ntz`.
+- `wide_numeric_as_decimal=` (default `false`, opt-in): maps a bare, unconstrained
+  `numeric` or one declared with precision over 38 to `decimal(38,18)` instead of the
+  default text fallback, for a Databricks target that wants a real decimal. A value too
+  wide even for that (more than 20 integer digits, or more than 18 significant fractional
+  ones) fails the load: it is a structural disagreement with the type the column now has,
+  not type uncertainty to degrade quietly. `Decimal128Builder` never validates this itself
+  (`finish` stores whatever unscaled integer it was given, however many digits), so
+  `values::parse_decimal` now checks the value's magnitude against its column's precision
+  before it ever reaches the builder, closing a latent gap that existed for ordinary
+  constrained `numeric(p,s)` columns too, not just the new wide-decimal case. A
+  `numeric(p,s)` with `p <= 38` whose scale Arrow cannot represent (negative, or exceeding
+  `p`) is a different, narrower declaration problem and keeps falling back to text
+  regardless of this flag, since reinterpreting its scale as 18 would silently change what
+  the column means. Decided with the user: opt-in (not the new default), overflow fails
+  the load (not a NULL substitution), and the scope covers both unconstrained and p>38 (not
+  just bare `numeric`).
 - Re-run story: `overwrite` is idempotent and a failed run commits nothing, so the
   recovery procedure is to run it again. Documented in `docs/operations.md`, Chapter V.
 - `VACUUM` guidance and a per-table loop are in `docs/operations.md`, Chapter IV.

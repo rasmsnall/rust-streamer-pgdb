@@ -99,6 +99,30 @@ impl ResolvedType {
 /// Arrow's `Decimal128` carries at most 38 significant digits.
 const MAX_DECIMAL_PRECISION: u8 = 38;
 
+/// The fixed decimal a too-wide `numeric` maps to when a caller opts into
+/// `LoadConfig::wide_numeric_as_decimal`, instead of the default text fallback.
+///
+/// `(38, 18)` is the widest `Decimal128` and a conventional choice for numeric data with
+/// no natural bound on a Databricks target, giving 20 integer digits and 18 fractional
+/// ones.
+pub const WIDE_NUMERIC_PRECISION: u8 = MAX_DECIMAL_PRECISION;
+/// See [`WIDE_NUMERIC_PRECISION`].
+pub const WIDE_NUMERIC_SCALE: i8 = 18;
+
+/// True for a `numeric` declaration `wide_numeric_as_decimal` answers "use
+/// `decimal(38,18)` instead of text" for: a bare, unconstrained `numeric`, or one whose
+/// declared precision exceeds what `Decimal128` can represent natively.
+///
+/// Deliberately narrower than "does not fit a fixed-width decimal"
+/// ([`decimal_fits`]'s negation): a precision within range but paired with a scale Arrow
+/// cannot represent (negative, or exceeding the precision) is excluded, and keeps falling
+/// back to text regardless of this flag. That is a different declaration problem than "no
+/// natural bound", and silently reinterpreting its scale as 18 would change what the
+/// column means without saying so.
+pub fn numeric_too_wide(precision: Option<u8>) -> bool {
+    precision.is_none_or(|p| p > MAX_DECIMAL_PRECISION)
+}
+
 /// True if a `numeric` of this precision and scale fits a fixed-width decimal.
 ///
 /// Arrow requires `1 <= precision <= 38` and `0 <= scale <= precision`. PostgreSQL 15 and

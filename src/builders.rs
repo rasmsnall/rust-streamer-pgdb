@@ -27,21 +27,36 @@ use deltalake::arrow::array::{
 use deltalake::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 
 use crate::error::{Error, Result};
-use crate::types::{PgType, ResolvedType};
+use crate::types::{self, PgType, ResolvedType};
 use crate::values;
 
-/// The timezone stamped on `timestamptz` columns.
+/// The timezone stamped on every `timestamp` column, with or without a source time zone.
 ///
-/// Delta's `timestamp` is microseconds UTC, so values are normalised to UTC on the way
-/// in and the column is labelled accordingly.
+/// Delta's `timestamp` is microseconds UTC. Arrow's own convention is that a `Timestamp`
+/// field with **no** timezone is *naive*, and delta-rs maps that straight to Delta's
+/// `timestamp_ntz`, which needs reader v3 / writer v7 and breaks the compatibility floor
+/// this library targets (see `docs/architecture.md`, Chapter X). A naive PostgreSQL
+/// `timestamp without time zone` is assumed to already be UTC (documented on the Python
+/// surface), so stamping it with this timezone, exactly like `timestamptz`, is what makes
+/// it land as Delta's plain `timestamp` instead. See [`crate::values::parse_timestamp`]:
+/// the value on the wire is already computed as UTC micros either way, so this is a
+/// schema label, not a value transform.
 const UTC: &str = "UTC";
 
 /// Returns the Arrow type a resolved column maps to.
 ///
-/// Columns that [`ResolvedType::is_textual`] identifies, which covers arrays,
-/// unconstrained or over-wide `numeric`, and everything unrecognised, map to `Utf8`
-/// regardless of their nominal type.
-pub fn arrow_type(rt: &ResolvedType) -> DataType {
+/// Columns that [`ResolvedType::is_textual`] identifies, which covers arrays and
+/// everything unrecognised, map to `Utf8` regardless of their nominal type. A too-wide
+/// `numeric` (see [`types::numeric_too_wide`]) also identifies as textual, but maps
+/// instead to `decimal(38,18)` when `wide_numeric_as_decimal` opts into it.
+pub fn arrow_type(rt: &ResolvedType, wide_numeric_as_decimal: bool) -> DataType {
+    if let PgType::Numeric { precision, .. } = rt.pg
+        && !rt.is_array
+        && wide_numeric_as_decimal
+        && types::numeric_too_wide(precision)
+    {
+        return DataType::Decimal128(types::WIDE_NUMERIC_PRECISION, types::WIDE_NUMERIC_SCALE);
+    }
     if rt.is_textual() {
         return DataType::Utf8;
     }
@@ -57,10 +72,10 @@ pub fn arrow_type(rt: &ResolvedType) -> DataType {
         }
         PgType::Boolean => DataType::Boolean,
         PgType::Date => DataType::Date32,
-        PgType::Timestamp { tz: false } => DataType::Timestamp(TimeUnit::Microsecond, None),
-        PgType::Timestamp { tz: true } => {
-            DataType::Timestamp(TimeUnit::Microsecond, Some(UTC.into()))
-        }
+        // Both variants carry the same Arrow type: a naive `timestamp` is assumed UTC
+        // (see the UTC constant's doc), and a bare Arrow `Timestamp` with no timezone at
+        // all would map to Delta's timestamp_ntz instead of timestamp.
+        PgType::Timestamp { .. } => DataType::Timestamp(TimeUnit::Microsecond, Some(UTC.into())),
         PgType::Time { .. } => DataType::Time64(TimeUnit::Microsecond),
         PgType::Bytea => DataType::Binary,
         PgType::Text => DataType::Utf8,
@@ -68,11 +83,11 @@ pub fn arrow_type(rt: &ResolvedType) -> DataType {
 }
 
 /// Builds the Arrow schema for a table's columns.
-pub fn arrow_schema(columns: &[(String, ResolvedType)]) -> Schema {
+pub fn arrow_schema(columns: &[(String, ResolvedType)], wide_numeric_as_decimal: bool) -> Schema {
     Schema::new(
         columns
             .iter()
-            .map(|(name, rt)| Field::new(name, arrow_type(rt), true))
+            .map(|(name, rt)| Field::new(name, arrow_type(rt, wide_numeric_as_decimal), true))
             .collect::<Vec<_>>(),
     )
 }
@@ -93,8 +108,9 @@ pub enum ColumnBuilder {
     Float32(Float32Builder),
     /// `double precision`.
     Float64(Float64Builder),
-    /// Fixed-scale `numeric`, carrying the scale used to align incoming values.
-    Decimal(Decimal128Builder, i8),
+    /// Fixed-precision `numeric`, carrying the precision and scale used to align and
+    /// validate incoming values.
+    Decimal(Decimal128Builder, u8, i8),
     /// `boolean`.
     Boolean(BooleanBuilder),
     /// `date`.
@@ -113,16 +129,29 @@ impl ColumnBuilder {
     /// Creates a builder matching `rt`.
     ///
     /// The builder must agree with [`arrow_type`], because the schema is built from the
-    /// latter and [`BatchBuilder::finish`] would otherwise fail. That agreement rests on
-    /// [`ResolvedType::is_textual`], which routes any `numeric` Arrow cannot represent to
-    /// text before either function sees it.
+    /// latter and [`BatchBuilder::finish`] would otherwise fail: both check a too-wide
+    /// `numeric` against `wide_numeric_as_decimal` first, then fall back to
+    /// [`ResolvedType::is_textual`], which routes anything else Arrow cannot represent
+    /// (arrays, everything unrecognised) to text.
     ///
     /// # Panics
     ///
-    /// Does not panic. The decimal fallback below is unreachable defence: if it ever did
-    /// fire, the mismatch with [`arrow_type`] would surface as [`Error::Arrow`] on the
-    /// next flush rather than as a panic here.
-    pub fn new(rt: &ResolvedType) -> Self {
+    /// Does not panic. The decimal fallbacks below are unreachable defence: if either
+    /// ever did fire, the mismatch with [`arrow_type`] would surface as [`Error::Arrow`]
+    /// on the next flush rather than as a panic here.
+    pub fn new(rt: &ResolvedType, wide_numeric_as_decimal: bool) -> Self {
+        if let PgType::Numeric { precision, .. } = rt.pg
+            && !rt.is_array
+            && wide_numeric_as_decimal
+            && types::numeric_too_wide(precision)
+        {
+            let p = types::WIDE_NUMERIC_PRECISION;
+            let s = types::WIDE_NUMERIC_SCALE;
+            return match Decimal128Builder::new().with_precision_and_scale(p, s) {
+                Ok(b) => ColumnBuilder::Decimal(b, p, s),
+                Err(_) => ColumnBuilder::Utf8(StringBuilder::new()),
+            };
+        }
         if rt.is_textual() {
             return ColumnBuilder::Utf8(StringBuilder::new());
         }
@@ -136,7 +165,7 @@ impl ColumnBuilder {
                 let p = precision.unwrap_or(38);
                 let s = scale.unwrap_or(0);
                 match Decimal128Builder::new().with_precision_and_scale(p, s) {
-                    Ok(b) => ColumnBuilder::Decimal(b, s),
+                    Ok(b) => ColumnBuilder::Decimal(b, p, s),
                     Err(_) => ColumnBuilder::Utf8(StringBuilder::new()),
                 }
             }
@@ -177,8 +206,8 @@ impl ColumnBuilder {
             ColumnBuilder::Int64(b) => b.append_option(values::parse_i64(v, column)?),
             ColumnBuilder::Float32(b) => b.append_option(values::parse_f32(v, column)?),
             ColumnBuilder::Float64(b) => b.append_option(values::parse_f64(v, column)?),
-            ColumnBuilder::Decimal(b, scale) => {
-                let parsed = values::parse_decimal(v, *scale, column)?;
+            ColumnBuilder::Decimal(b, precision, scale) => {
+                let parsed = values::parse_decimal(v, *precision, *scale, column)?;
                 substituted = parsed.is_none();
                 b.append_option(parsed);
             }
@@ -219,7 +248,7 @@ impl ColumnBuilder {
             ColumnBuilder::Int64(b) => b.append_null(),
             ColumnBuilder::Float32(b) => b.append_null(),
             ColumnBuilder::Float64(b) => b.append_null(),
-            ColumnBuilder::Decimal(b, _) => b.append_null(),
+            ColumnBuilder::Decimal(b, ..) => b.append_null(),
             ColumnBuilder::Boolean(b) => b.append_null(),
             ColumnBuilder::Date(b) => b.append_null(),
             ColumnBuilder::Timestamp(b, _) => b.append_null(),
@@ -237,16 +266,14 @@ impl ColumnBuilder {
             ColumnBuilder::Int64(b) => Arc::new(b.finish()),
             ColumnBuilder::Float32(b) => Arc::new(b.finish()),
             ColumnBuilder::Float64(b) => Arc::new(b.finish()),
-            ColumnBuilder::Decimal(b, _) => Arc::new(b.finish()),
+            ColumnBuilder::Decimal(b, ..) => Arc::new(b.finish()),
             ColumnBuilder::Boolean(b) => Arc::new(b.finish()),
             ColumnBuilder::Date(b) => Arc::new(b.finish()),
-            ColumnBuilder::Timestamp(b, tz) => {
-                let array = b.finish();
-                if *tz {
-                    Arc::new(array.with_timezone(UTC))
-                } else {
-                    Arc::new(array)
-                }
+            ColumnBuilder::Timestamp(b, _) => {
+                // Stamped regardless of the source's own tz-ness: the schema declares
+                // this timezone for both (see the UTC constant's doc), and the array's
+                // type must agree with the schema's or batch construction fails.
+                Arc::new(b.finish().with_timezone(UTC))
             }
             ColumnBuilder::Time(b) => Arc::new(b.finish()),
             ColumnBuilder::Binary(b) => Arc::new(b.finish()),
@@ -275,13 +302,18 @@ pub struct BatchBuilder {
 
 impl BatchBuilder {
     /// Creates a builder for `columns`, bounded by `max_rows` and `max_bytes`.
-    pub fn new(columns: &[(String, ResolvedType)], max_rows: usize, max_bytes: usize) -> Self {
+    pub fn new(
+        columns: &[(String, ResolvedType)],
+        max_rows: usize,
+        max_bytes: usize,
+        wide_numeric_as_decimal: bool,
+    ) -> Self {
         Self {
-            schema: Arc::new(arrow_schema(columns)),
+            schema: Arc::new(arrow_schema(columns, wide_numeric_as_decimal)),
             names: columns.iter().map(|(n, _)| n.clone()).collect(),
             columns: columns
                 .iter()
-                .map(|(_, rt)| ColumnBuilder::new(rt))
+                .map(|(_, rt)| ColumnBuilder::new(rt, wide_numeric_as_decimal))
                 .collect(),
             rows: 0,
             bytes: 0,
@@ -421,28 +453,33 @@ mod tests {
 
     #[test]
     fn types_map_as_documented() {
-        assert_eq!(arrow_type(&resolve("smallint")), DataType::Int16);
-        assert_eq!(arrow_type(&resolve("integer")), DataType::Int32);
-        assert_eq!(arrow_type(&resolve("bigint")), DataType::Int64);
-        assert_eq!(arrow_type(&resolve("real")), DataType::Float32);
-        assert_eq!(arrow_type(&resolve("double precision")), DataType::Float64);
-        assert_eq!(arrow_type(&resolve("boolean")), DataType::Boolean);
-        assert_eq!(arrow_type(&resolve("date")), DataType::Date32);
-        assert_eq!(arrow_type(&resolve("bytea")), DataType::Binary);
+        assert_eq!(arrow_type(&resolve("smallint"), false), DataType::Int16);
+        assert_eq!(arrow_type(&resolve("integer"), false), DataType::Int32);
+        assert_eq!(arrow_type(&resolve("bigint"), false), DataType::Int64);
+        assert_eq!(arrow_type(&resolve("real"), false), DataType::Float32);
         assert_eq!(
-            arrow_type(&resolve("numeric(10,2)")),
+            arrow_type(&resolve("double precision"), false),
+            DataType::Float64
+        );
+        assert_eq!(arrow_type(&resolve("boolean"), false), DataType::Boolean);
+        assert_eq!(arrow_type(&resolve("date"), false), DataType::Date32);
+        assert_eq!(arrow_type(&resolve("bytea"), false), DataType::Binary);
+        assert_eq!(
+            arrow_type(&resolve("numeric(10,2)"), false),
             DataType::Decimal128(10, 2)
         );
         assert_eq!(
-            arrow_type(&resolve("timestamp without time zone")),
-            DataType::Timestamp(TimeUnit::Microsecond, None)
+            arrow_type(&resolve("timestamp without time zone"), false),
+            DataType::Timestamp(TimeUnit::Microsecond, Some(UTC.into())),
+            "a naive timestamp must carry a timezone in its Arrow type too, or delta-rs \
+             maps it to timestamp_ntz instead of timestamp"
         );
         assert_eq!(
-            arrow_type(&resolve("timestamp with time zone")),
+            arrow_type(&resolve("timestamp with time zone"), false),
             DataType::Timestamp(TimeUnit::Microsecond, Some(UTC.into()))
         );
         assert_eq!(
-            arrow_type(&resolve("time without time zone")),
+            arrow_type(&resolve("time without time zone"), false),
             DataType::Time64(TimeUnit::Microsecond)
         );
     }
@@ -457,8 +494,45 @@ mod tests {
             "interval",
             "jsonb",
         ] {
-            assert_eq!(arrow_type(&resolve(t)), DataType::Utf8, "{t}");
+            assert_eq!(arrow_type(&resolve(t), false), DataType::Utf8, "{t}");
         }
+    }
+
+    /// `wide_numeric_as_decimal` maps a too-wide `numeric` to `decimal(38,18)`, but leaves
+    /// arrays, a `numeric(p,s)` that already fits, and a `numeric(p,s)` whose scale Arrow
+    /// cannot represent (a narrower, different problem) exactly as they were.
+    #[test]
+    fn wide_numeric_as_decimal_only_affects_too_wide_numeric() {
+        assert_eq!(
+            arrow_type(&resolve("numeric"), true),
+            DataType::Decimal128(38, 18),
+            "unconstrained numeric"
+        );
+        assert_eq!(
+            arrow_type(&resolve("numeric(39,2)"), true),
+            DataType::Decimal128(38, 18),
+            "precision over 38"
+        );
+        assert_eq!(
+            arrow_type(&resolve("numeric(10,2)"), true),
+            DataType::Decimal128(10, 2),
+            "already fits natively; must not be widened"
+        );
+        assert_eq!(
+            arrow_type(&resolve("numeric(2,5)"), true),
+            DataType::Utf8,
+            "scale exceeding precision is a different problem, unaffected by this flag"
+        );
+        assert_eq!(
+            arrow_type(&resolve("numeric(5,-2)"), true),
+            DataType::Utf8,
+            "negative scale is a different problem, unaffected by this flag"
+        );
+        assert_eq!(
+            arrow_type(&resolve("numeric[]"), true),
+            DataType::Utf8,
+            "arrays stay text regardless of this flag"
+        );
     }
 
     #[test]
@@ -471,7 +545,7 @@ mod tests {
             ("born", "date"),
             ("blob", "bytea"),
         ]);
-        let mut b = BatchBuilder::new(&columns, 1000, 1 << 20);
+        let mut b = BatchBuilder::new(&columns, 1000, 1 << 20, false);
 
         b.append_row(&[
             Some(b"1"),
@@ -538,7 +612,7 @@ mod tests {
     #[test]
     fn finish_resets_for_reuse() {
         let columns = cols(&[("id", "integer")]);
-        let mut b = BatchBuilder::new(&columns, 1000, 1 << 20);
+        let mut b = BatchBuilder::new(&columns, 1000, 1 << 20, false);
         b.append_row(&[Some(b"1")]).unwrap();
         assert_eq!(b.finish().unwrap().unwrap().num_rows(), 1);
         assert_eq!(b.rows(), 0);
@@ -553,7 +627,7 @@ mod tests {
     #[test]
     fn unrepresentable_values_become_null_and_are_counted() {
         let columns = cols(&[("t", "timestamp without time zone"), ("n", "numeric(5,2)")]);
-        let mut b = BatchBuilder::new(&columns, 1000, 1 << 20);
+        let mut b = BatchBuilder::new(&columns, 1000, 1 << 20, false);
         b.append_row(&[Some(b"infinity"), Some(b"NaN")]).unwrap();
         b.append_row(&[Some(b"1970-01-01 00:00:00"), Some(b"1.00")])
             .unwrap();
@@ -567,7 +641,7 @@ mod tests {
     #[test]
     fn timestamptz_carries_utc_in_its_type() {
         let columns = cols(&[("t", "timestamp with time zone")]);
-        let mut b = BatchBuilder::new(&columns, 10, 1 << 20);
+        let mut b = BatchBuilder::new(&columns, 10, 1 << 20, false);
         b.append_row(&[Some(b"2024-01-01 13:00:00+01")]).unwrap();
         let batch = b.finish().unwrap().unwrap();
         assert_eq!(
@@ -583,7 +657,7 @@ mod tests {
     #[test]
     fn arity_mismatch_is_rejected() {
         let columns = cols(&[("a", "integer"), ("b", "integer")]);
-        let mut b = BatchBuilder::new(&columns, 10, 1 << 20);
+        let mut b = BatchBuilder::new(&columns, 10, 1 << 20, false);
         assert_eq!(
             b.append_row(&[Some(b"1")]).unwrap_err(),
             Error::FieldCountMismatch {
@@ -596,7 +670,7 @@ mod tests {
     #[test]
     fn malformed_value_fails_the_load() {
         let columns = cols(&[("a", "integer")]);
-        let mut b = BatchBuilder::new(&columns, 10, 1 << 20);
+        let mut b = BatchBuilder::new(&columns, 10, 1 << 20, false);
         assert!(matches!(
             b.append_row(&[Some(b"not-a-number")]),
             Err(Error::UnparsableValue { .. })
@@ -606,7 +680,7 @@ mod tests {
     #[test]
     fn non_utf8_text_fails_rather_than_corrupting() {
         let columns = cols(&[("a", "text")]);
-        let mut b = BatchBuilder::new(&columns, 10, 1 << 20);
+        let mut b = BatchBuilder::new(&columns, 10, 1 << 20, false);
         assert!(matches!(
             b.append_row(&[Some(&[0xFF, 0xFE])]),
             Err(Error::NonUtf8Text { .. })
@@ -616,14 +690,14 @@ mod tests {
     #[test]
     fn bounds_signal_when_to_flush() {
         let columns = cols(&[("a", "integer")]);
-        let mut b = BatchBuilder::new(&columns, 2, 1 << 20);
+        let mut b = BatchBuilder::new(&columns, 2, 1 << 20, false);
         assert!(!b.is_full());
         b.append_row(&[Some(b"1")]).unwrap();
         assert!(!b.is_full());
         b.append_row(&[Some(b"2")]).unwrap();
         assert!(b.is_full());
 
-        let mut b = BatchBuilder::new(&columns, 1_000_000, 4);
+        let mut b = BatchBuilder::new(&columns, 1_000_000, 4, false);
         b.append_row(&[Some(b"12345")]).unwrap();
         assert!(b.is_full(), "byte bound must also trigger a flush");
     }
@@ -631,7 +705,7 @@ mod tests {
     #[test]
     fn array_columns_keep_their_postgres_literal() {
         let columns = cols(&[("tags", "text[]")]);
-        let mut b = BatchBuilder::new(&columns, 10, 1 << 20);
+        let mut b = BatchBuilder::new(&columns, 10, 1 << 20, false);
         b.append_row(&[Some(b"{a,b,c}")]).unwrap();
         let batch = b.finish().unwrap().unwrap();
         let got = batch
