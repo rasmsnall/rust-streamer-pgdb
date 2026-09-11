@@ -1070,9 +1070,7 @@ INHERITS (public.parent);",
         let ev = s.feed(&dump).unwrap();
 
         assert_eq!(
-            ev.iter()
-                .filter(|e| matches!(e, Event::Table(_)))
-                .count(),
+            ev.iter().filter(|e| matches!(e, Event::Table(_))).count(),
             1,
             "only the non-excluded table should be recovered: {ev:?}"
         );

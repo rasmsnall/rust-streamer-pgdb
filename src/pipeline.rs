@@ -678,8 +678,7 @@ where
                 .is_some_and(|s| schemas.iter().any(|x| x == s))
         })
     };
-    let wanted =
-        |table: &TableName, qualified: &str| allowed(qualified) && !schema_excluded(table);
+    let wanted = |table: &TableName, qualified: &str| allowed(qualified) && !schema_excluded(table);
 
     while let Some(chunk) = chunks.next_chunk()? {
         let bytes_read = consumed.load(Ordering::Relaxed);
