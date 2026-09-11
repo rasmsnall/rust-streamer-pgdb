@@ -46,9 +46,9 @@ const UTC: &str = "UTC";
 
 /// Returns the Arrow type a resolved column maps to.
 ///
-/// Columns that [`ResolvedType::is_textual`] identifies, which covers arrays (unless
-/// [`array_element_type`] finds a native mapping under `native_arrays`) and everything
-/// unrecognised, map to `Utf8` regardless of their nominal type. A too-wide `numeric`
+/// Columns that [`ResolvedType::is_textual`] identifies, which covers arrays (unless a
+/// native mapping is found under `native_arrays`) and everything unrecognised, map to
+/// `Utf8` regardless of their nominal type. A too-wide `numeric`
 /// (see [`types::numeric_too_wide`]) also identifies as textual, but maps instead to
 /// `decimal(38,18)` when `wide_numeric_as_decimal` opts into it.
 pub fn arrow_type(

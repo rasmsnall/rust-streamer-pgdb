@@ -126,9 +126,9 @@ pub const WIDE_NUMERIC_SCALE: i8 = 18;
 /// `decimal(38,18)` instead of text" for: a bare, unconstrained `numeric`, or one whose
 /// declared precision exceeds what `Decimal128` can represent natively.
 ///
-/// Deliberately narrower than "does not fit a fixed-width decimal"
-/// ([`decimal_fits`]'s negation): a precision within range but paired with a scale Arrow
-/// cannot represent (negative, or exceeding the precision) is excluded, and keeps falling
+/// Deliberately narrower than "does not fit a fixed-width decimal" (`decimal_fits`'s
+/// negation): a precision within range but paired with a scale Arrow cannot represent
+/// (negative, or exceeding the precision) is excluded, and keeps falling
 /// back to text regardless of this flag. That is a different declaration problem than "no
 /// natural bound", and silently reinterpreting its scale as 18 would change what the
 /// column means without saying so.
