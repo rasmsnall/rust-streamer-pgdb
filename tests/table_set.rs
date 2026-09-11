@@ -148,6 +148,82 @@ fn a_filtered_table_is_seen_even_though_it_is_not_loaded() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A table in an excluded schema is loaded exactly as if it had been left out of
+/// `tables`: seen for drift purposes, but never committed.
+#[test]
+fn an_excluded_schema_is_not_loaded() {
+    let dir = tmpdir("excluded");
+    let mut d =
+        String::from("-- Dumped from database version 17.4\n-- Dumped by pg_dump version 17.4\n");
+    d.push_str("CREATE TABLE audit.log (\n    id integer\n);\n");
+    d.push_str("CREATE TABLE public.a (\n    id integer\n);\n");
+    d.push_str("COPY audit.log (id) FROM stdin;\n1\n\\.\n");
+    d.push_str("COPY public.a (id) FROM stdin;\n1\n\\.\n");
+
+    let cfg = LoadConfig {
+        excluded_schemas: Some(vec!["audit".to_string()]),
+        ..config(&dir)
+    };
+    let report = run(Cursor::new(d.into_bytes()), &cfg, |_| true).unwrap();
+
+    assert_eq!(report.tables.len(), 1, "only public.a should be loaded");
+    assert_eq!(report.tables[0].table, "public.a");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A schema excluded on purpose stays excluded even if one of its tables was also named
+/// in `tables`: exclusion is the stronger, more specific intent.
+#[test]
+fn excluded_schema_wins_over_the_table_allow_list() {
+    let dir = tmpdir("excluded-wins");
+    let mut d =
+        String::from("-- Dumped from database version 17.4\n-- Dumped by pg_dump version 17.4\n");
+    d.push_str("CREATE TABLE audit.log (\n    id integer\n);\n");
+    d.push_str("COPY audit.log (id) FROM stdin;\n1\n\\.\n");
+
+    let cfg = LoadConfig {
+        tables: Some(vec!["audit.log".to_string()]),
+        excluded_schemas: Some(vec!["audit".to_string()]),
+        ..config(&dir)
+    };
+    let report = run(Cursor::new(d.into_bytes()), &cfg, |_| true).unwrap();
+
+    assert!(report.tables.is_empty(), "exclusion must win: {report:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `CREATE TABLE` this hand-rolled parser cannot handle, such as one with no column
+/// list at all, must not fail the load when it sits in an excluded schema, since the load
+/// never needed that table's parsed shape.
+#[test]
+fn unparseable_ddl_in_an_excluded_schema_does_not_fail_the_load() {
+    let dir = tmpdir("excluded-unparseable");
+    let mut d =
+        String::from("-- Dumped from database version 17.4\n-- Dumped by pg_dump version 17.4\n");
+    // No `(` anywhere in the statement: parse_create_table cannot find a column list and
+    // rejects it with MalformedCreateTable. Confirmed below, unexcluded, that it does.
+    d.push_str("CREATE TABLE audit.log not really a column list);\n");
+    d.push_str("CREATE TABLE public.a (\n    id integer\n);\n");
+    d.push_str("COPY public.a (id) FROM stdin;\n1\n\\.\n");
+
+    let cfg = LoadConfig {
+        excluded_schemas: Some(vec!["audit".to_string()]),
+        ..config(&dir)
+    };
+    let report = run(Cursor::new(d.clone().into_bytes()), &cfg, |_| true).unwrap();
+
+    assert_eq!(report.tables.len(), 1);
+    assert_eq!(report.tables[0].table, "public.a");
+
+    let unexcluded = config(&dir);
+    let err = run(Cursor::new(d.into_bytes()), &unexcluded, |_| true).unwrap_err();
+    assert!(
+        matches!(err, Error::MalformedCreateTable { .. }),
+        "expected the same DDL to fail once its schema is not excluded: {err:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn nothing_is_reported_without_an_expectation() {
     let dir = tmpdir("none");

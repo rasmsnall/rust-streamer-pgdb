@@ -147,6 +147,7 @@ def stream_dump_to_delta(
     output_uri: str,
     *,
     tables: Sequence[str] | None = ...,
+    excluded_schemas: Sequence[str] | None = ...,
     mode: Literal["overwrite", "append", "error"] = ...,
     batch_rows: int = ...,
     batch_bytes: int = ...,
@@ -190,6 +191,13 @@ def stream_dump_to_delta(
     tables:
         Qualified names to load. ``None`` loads every table in the dump; other ``COPY``
         blocks are scanned for their terminator and skipped.
+    excluded_schemas:
+        PostgreSQL schema (namespace) names to exclude entirely, for example
+        ``["audit", "staging"]``. A table in one of these schemas is never loaded, like one
+        left out of ``tables``, but its ``CREATE TABLE`` is also never fully parsed: this
+        library recognises just enough to find where the statement ends, so a DDL
+        construct it cannot parse, inside a schema you do not want, can never fail the
+        load. Applies even to a table also named in ``tables``: exclusion wins.
     mode:
         ``"overwrite"`` tombstones the previous run's files in the same commit that adds
         the new ones. ``"append"`` adds to what is there. ``"error"`` fails if the target

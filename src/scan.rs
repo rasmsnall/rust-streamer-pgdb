@@ -18,7 +18,7 @@
 //! forward pass possible with no seeking and no buffering of the dump.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::copy::is_end_of_data;
@@ -144,10 +144,18 @@ pub struct Scanner {
     /// Accumulated text of a `CREATE TABLE` currently being read.
     ddl: Vec<u8>,
     in_create: bool,
+    /// Set while reading the continuation lines of a `CREATE TABLE` in an excluded
+    /// schema. No text is accumulated; the scanner only watches for the line that ends
+    /// the statement, so it never runs the column parser over DDL from a table nobody
+    /// wants.
+    skipping_create: bool,
     open_table: Option<TableName>,
     dumped_by: Option<u32>,
     from_database: Option<u32>,
     tables: HashMap<String, TableDef>,
+    /// Schemas whose tables are recognised only well enough to skip. See
+    /// [`Scanner::set_excluded_schemas`].
+    excluded_schemas: HashSet<String>,
 }
 
 impl Default for Scanner {
@@ -164,11 +172,50 @@ impl Scanner {
             pending: Vec::new(),
             ddl: Vec::new(),
             in_create: false,
+            skipping_create: false,
             open_table: None,
             dumped_by: None,
             from_database: None,
             tables: HashMap::new(),
+            excluded_schemas: HashSet::new(),
         }
+    }
+
+    /// Configures schema names to skip.
+    ///
+    /// A `CREATE TABLE` naming one of these schemas is recognised only well enough to
+    /// find where its statement ends: no [`Event::Table`] is emitted, its columns are
+    /// never parsed, and it never appears in [`Scanner::tables`]. This means a construct
+    /// this scanner's hand-rolled parser cannot handle, inside a table nobody wants, can
+    /// never fail the load, because the load never depends on that table's parsed shape.
+    ///
+    /// The table's `COPY` block is unaffected here: its start and end are still observed
+    /// like any other, since a caller may still choose to decode it. Skipping the row
+    /// decode itself is the caller's job; see
+    /// [`crate::pipeline::LoadConfig::excluded_schemas`], which does both together.
+    ///
+    /// Takes effect on statements read after this call; it does not retroactively affect
+    /// tables already recovered into [`Scanner::tables`].
+    pub fn set_excluded_schemas(&mut self, excluded_schemas: impl IntoIterator<Item = String>) {
+        self.excluded_schemas = excluded_schemas.into_iter().collect();
+    }
+
+    /// Peeks the schema of a `CREATE TABLE` statement's name, without parsing its columns.
+    ///
+    /// `after_create_table_kw` is everything past the `CREATE TABLE` (or `CREATE
+    /// UNLOGGED TABLE`) keyword; the qualified name always starts it, since pg_dump
+    /// writes the name before the column list's opening paren on the same line.
+    ///
+    /// Best-effort: a name this scanner cannot even read is left for
+    /// [`parse_create_table`] to reject with a precise error, rather than silently
+    /// treated as not excluded here.
+    fn schema_is_excluded(&self, after_create_table_kw: &[u8]) -> bool {
+        if self.excluded_schemas.is_empty() {
+            return false;
+        }
+        take_qualified(after_create_table_kw)
+            .and_then(|(name, _)| name.schema)
+            .is_some_and(|schema| self.excluded_schemas.contains(&schema))
     }
 
     /// Major version of the `pg_dump` that produced this dump, once the preamble is read.
@@ -297,6 +344,13 @@ impl Scanner {
     }
 
     fn sql_line(&mut self, line: &[u8], events: &mut Vec<Event<'_>>) -> Result<()> {
+        if self.skipping_create {
+            if line.trim_ascii_end().ends_with(b");") {
+                self.skipping_create = false;
+            }
+            return Ok(());
+        }
+
         if self.in_create {
             self.ddl.push(b'\n');
             self.ddl.extend_from_slice(line);
@@ -334,7 +388,13 @@ impl Scanner {
             return Ok(());
         }
 
-        if strip_create_table(line).is_some() {
+        if let Some(after_kw) = strip_create_table(line) {
+            if self.schema_is_excluded(after_kw) {
+                if !line.trim_ascii_end().ends_with(b");") {
+                    self.skipping_create = true;
+                }
+                return Ok(());
+            }
             // pg_dump writes the opening paren on the first line and one column per
             // line thereafter, but a single-line form is also accepted.
             self.ddl.clear();
@@ -971,6 +1031,66 @@ INHERITS (public.parent);",
         let ev = s.feed(b"\\\\.\n\\.\n").unwrap();
         assert_eq!(ev[0], Event::CopyRows(Cow::Borrowed(b"\\\\.\n")));
         assert!(matches!(ev[1], Event::CopyEnd { .. }));
+    }
+
+    #[test]
+    fn excluded_schema_table_is_not_recovered() {
+        let mut s = Scanner::new();
+        s.set_excluded_schemas(["audit".to_string()]);
+        let mut dump = PREAMBLE.to_vec();
+        dump.extend_from_slice(b"CREATE TABLE audit.log (id integer);\n");
+        dump.extend_from_slice(b"CREATE TABLE public.t (id integer);\n");
+        let ev = s.feed(&dump).unwrap();
+
+        assert!(
+            !ev.iter()
+                .any(|e| matches!(e, Event::Table(d) if d.name.schema.as_deref() == Some("audit"))),
+            "an excluded schema's table must not be emitted"
+        );
+        assert!(
+            ev.iter()
+                .any(|e| matches!(e, Event::Table(d) if d.name.table == "t")),
+            "a table outside the excluded schema must still be recovered"
+        );
+        assert!(!s.tables().contains_key("audit.log"));
+        assert!(s.tables().contains_key("public.t"));
+    }
+
+    #[test]
+    fn excluded_schema_skips_multiline_ddl_without_parsing_it() {
+        let mut s = Scanner::new();
+        s.set_excluded_schemas(["audit".to_string()]);
+        let mut dump = PREAMBLE.to_vec();
+        // A constraint form this hand-rolled parser cannot handle would normally fail
+        // `parse_create_table`; excluding the schema must skip it entirely instead.
+        dump.extend_from_slice(
+            b"CREATE TABLE audit.log (\n    id integer,\n    ~~not valid SQL~~\n);\n",
+        );
+        dump.extend_from_slice(b"CREATE TABLE public.t (id integer);\n");
+        let ev = s.feed(&dump).unwrap();
+
+        assert_eq!(
+            ev.iter()
+                .filter(|e| matches!(e, Event::Table(_)))
+                .count(),
+            1,
+            "only the non-excluded table should be recovered: {ev:?}"
+        );
+    }
+
+    #[test]
+    fn excluded_schema_copy_block_is_still_observed() {
+        let mut s = Scanner::new();
+        s.set_excluded_schemas(["audit".to_string()]);
+        let mut dump = PREAMBLE.to_vec();
+        dump.extend_from_slice(b"CREATE TABLE audit.log (id integer);\n");
+        dump.extend_from_slice(b"COPY audit.log (id) FROM stdin;\n1\n\\.\n");
+        let ev = s.feed(&dump).unwrap();
+        s.finish().unwrap();
+
+        // The scanner itself still observes the block; a caller decides whether to
+        // decode its rows. See LoadConfig::excluded_schemas for the decoding side.
+        assert!(matches!(ev.last(), Some(Event::CopyEnd { .. })));
     }
 
     #[test]

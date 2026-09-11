@@ -92,8 +92,20 @@ pub struct LoadConfig {
     pub output_uri: String,
     /// Qualified names of the tables to load. `None` loads every table in the dump; a
     /// `COPY` block for any other table is scanned for its terminator and otherwise
-    /// skipped, which costs almost nothing.
+    /// skipped, which costs almost nothing. See also [`LoadConfig::excluded_schemas`].
     pub tables: Option<Vec<String>>,
+    /// PostgreSQL schema (namespace) names to exclude entirely. `None` excludes nothing.
+    ///
+    /// A table in one of these schemas is never loaded, exactly like one left out of
+    /// [`LoadConfig::tables`], but its `CREATE TABLE` is also never fully parsed: the
+    /// scanner recognises only enough to find where the statement ends, so a DDL
+    /// construct this library's hand-rolled parser cannot handle, inside a schema
+    /// nobody wants, can never fail the load. That is the difference from `tables`,
+    /// whose unwanted tables are still fully parsed even though never loaded.
+    ///
+    /// Applies even to a table also named in `tables`: exclusion wins, since it states
+    /// the stronger intent of never touching that schema at all.
+    pub excluded_schemas: Option<Vec<String>>,
     /// How an existing Delta table is treated. See [`WriteMode`].
     pub mode: WriteMode,
     /// Row ceiling for one in-memory Arrow batch.
@@ -142,6 +154,7 @@ impl Default for LoadConfig {
         Self {
             output_uri: String::new(),
             tables: None,
+            excluded_schemas: None,
             mode: WriteMode::Overwrite,
             batch_rows: 100_000,
             batch_bytes: 128 << 20,
@@ -627,6 +640,9 @@ where
         .max(crate::dump::DEFAULT_CHUNK_BYTES);
     let mut chunks = ChunkReader::with_limits(reader, crate::dump::DEFAULT_CHUNK_BYTES, max_chunk);
     let mut scanner = Scanner::new();
+    if let Some(schemas) = &config.excluded_schemas {
+        scanner.set_excluded_schemas(schemas.iter().cloned());
+    }
 
     // Every table whose COPY block was seen, filtered or not, so the comparison is
     // against the dump rather than against what this run chose to load.
@@ -646,12 +662,24 @@ where
     let mut round_robin: usize = 0;
     let mut skipping = false;
 
-    let wanted = |name: &str| {
+    let allowed = |name: &str| {
         config
             .tables
             .as_deref()
             .is_none_or(|t| t.iter().any(|x| x == name))
     };
+    // Exclusion wins over `tables`: a schema excluded on purpose stays excluded even if
+    // one of its tables was also (perhaps mistakenly) named in the allow-list.
+    let schema_excluded = |table: &TableName| {
+        config.excluded_schemas.as_deref().is_some_and(|schemas| {
+            table
+                .schema
+                .as_deref()
+                .is_some_and(|s| schemas.iter().any(|x| x == s))
+        })
+    };
+    let wanted =
+        |table: &TableName, qualified: &str| allowed(qualified) && !schema_excluded(table);
 
     while let Some(chunk) = chunks.next_chunk()? {
         let bytes_read = consumed.load(Ordering::Relaxed);
@@ -688,7 +716,7 @@ where
                     }
                     let qualified = table.qualified();
                     seen_tables.insert(qualified.clone());
-                    if !wanted(&qualified) {
+                    if !wanted(&table, &qualified) {
                         skipping = true;
                         continue;
                     }

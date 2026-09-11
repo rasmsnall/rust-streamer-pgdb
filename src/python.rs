@@ -237,6 +237,12 @@ fn parse_mode(mode: &str) -> PyResult<WriteMode> {
 ///     rejected, not sanitised, if it would escape the prefix.
 /// tables : list[str] | None
 ///     Qualified names to load. ``None`` loads every table in the dump.
+/// excluded_schemas : list[str] | None
+///     PostgreSQL schema (namespace) names to exclude entirely, for example
+///     ``["audit", "staging"]``. A table in one of these schemas is never loaded, like one
+///     left out of ``tables``, but its ``CREATE TABLE`` is also never fully parsed, so a
+///     DDL construct this library cannot parse in a schema you do not want can never fail
+///     the load. Applies even to a table also named in ``tables``: exclusion wins.
 /// mode : str
 ///     ``"overwrite"``, ``"append"`` or ``"error"``. Overwrite tombstones the previous
 ///     run's files in the same commit that adds the new ones.
@@ -322,6 +328,7 @@ fn parse_mode(mode: &str) -> PyResult<WriteMode> {
     output_uri,
     *,
     tables = None,
+    excluded_schemas = None,
     mode = "overwrite",
     batch_rows = 100_000,
     batch_bytes = 128 << 20,
@@ -342,6 +349,7 @@ fn stream_dump_to_delta(
     dump_path: &Bound<'_, PyAny>,
     output_uri: String,
     tables: Option<Vec<String>>,
+    excluded_schemas: Option<Vec<String>>,
     mode: &str,
     batch_rows: usize,
     batch_bytes: usize,
@@ -371,6 +379,7 @@ fn stream_dump_to_delta(
     let config = LoadConfig {
         output_uri,
         tables,
+        excluded_schemas,
         mode: parse_mode(mode)?,
         batch_rows,
         batch_bytes,

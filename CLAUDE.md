@@ -270,6 +270,7 @@ timestamp, ` BC` suffixed dates, and `NaN` for numeric.
 pgdelta.stream_dump_to_delta(
     dump_path=...,          # file, or a file descriptor / readable stream
     tables=["public.users"],
+    excluded_schemas=["audit", "staging"],
     output_uri="/Volumes/main/raw/pg/",
     mode="overwrite" | "append" | "error",
     batch_rows=100_000,
@@ -397,6 +398,10 @@ Resolved and shipped:
 - Schema drift is all-or-nothing ("either fail or load"), via two-phase.
 - `tables=` filtering lives in the scanner. An unwanted COPY block is scanned for its
   terminator and decoded not at all.
+- `excluded_schemas=` goes further: the scanner recognises an excluded table's `CREATE
+  TABLE` only well enough to find its end, never parsing a column. Unlike `tables`, this
+  means a DDL construct this library cannot parse, in a schema nobody wanted, cannot fail
+  the load. Exclusion wins over a name also listed in `tables`.
 - Re-run story: `overwrite` is idempotent and a failed run commits nothing, so the
   recovery procedure is to run it again. Documented in `docs/operations.md`, Chapter V.
 - `VACUUM` guidance and a per-table loop are in `docs/operations.md`, Chapter IV.

@@ -117,6 +117,7 @@ report = pgdelta.stream_dump_to_delta(
     output_uri,
     *,
     tables=None,
+    excluded_schemas=None,
     mode="overwrite",
     batch_rows=100_000,
     batch_bytes=134_217_728,
@@ -165,6 +166,7 @@ which is idempotent in `overwrite` mode. See `architecture.md`, Chapter VI, Sect
 | `dump_path` | `str` or `os.PathLike` | required | Local path, `file://`, or an object: `abfss://`, `az://`, `gs://`, `s3://`. Read directly, with resume. gzip decoded transparently |
 | `output_uri` | `str` | required | Prefix every table is written beneath |
 | `tables` | `list[str]` or `None` | `None` | Qualified names to load. `None` loads every table in the dump |
+| `excluded_schemas` | `list[str]` or `None` | `None` | PostgreSQL schema (namespace) names to exclude entirely. See Chapter V, Section 2 |
 | `mode` | `str` | `"overwrite"` | `"overwrite"`, `"append"` or `"error"`. See Chapter V, Section 1 |
 | `batch_rows` | `int` | `100_000` | Row ceiling for one in-memory Arrow batch |
 | `batch_bytes` | `int` | `128 << 20` | Byte ceiling for one in-memory Arrow batch, on decoded field bytes |
@@ -477,6 +479,19 @@ A name in `tables` that never appears in the dump is not an error and is not rep
 you need to know that a table you expected was absent, compare the names in
 `report.tables` against your list.
 
+`excluded_schemas` matches against the PostgreSQL schema (namespace) part of the name, for
+example `"audit"` in `"audit.log"`. It goes one step further than `tables`: an excluded
+table's `CREATE TABLE` is not just left unloaded, it is never fully parsed. The scanner
+reads only as far as the table's qualified name, then skips forward to the statement's end
+without parsing a single column. Practically, this means a DDL construct in a schema you
+never wanted, that this library's hand-rolled parser cannot handle, cannot fail the load;
+had that table instead only been left out of `tables`, its DDL would still have been
+parsed in full and any parse failure there would still fail the whole load, because the
+scanner cannot know in advance which tables the caller wants.
+
+A table named in `tables` but sitting in a schema named in `excluded_schemas` is excluded:
+the schema exclusion is the stronger, more specific statement of intent and wins.
+
 ### 3. Naming and output paths
 
 A table maps to `output_uri` plus its schema and name as path components, so
@@ -687,6 +702,7 @@ async context will deadlock.
 | `mode="overwrite"` | The dump is a full daily snapshot, which is the intended case |
 | `mode="error"` | A one-off backfill that must not clobber an existing table |
 | `tables` | You need a subset. Skipping a block is nearly free |
+| `excluded_schemas` | You never want an entire schema, especially one whose DDL this library might not parse |
 | `threads` | The driver is shared, or memory is tight. Otherwise leave it |
 | `batch_bytes` | Memory is tight. Lower this before lowering `threads` |
 | `storage_options` | Output is `abfss://` or another authenticated backend |
