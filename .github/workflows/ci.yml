@@ -11,8 +11,9 @@ env:
   RUST_BACKTRACE: 1
   # Everything except extension-module. That feature tells pyo3 not to link libpython,
   # which is right for the wheel and fatal for a test binary, so --all-features must not
-  # be used anywhere a binary is linked.
-  LIB_FEATURES: azure,fast-gzip
+  # be used anywhere a binary is linked. zstd needs a C toolchain (zstd-sys) but no
+  # cmake; ubuntu-latest ships one, so no extra install step is needed for it here.
+  LIB_FEATURES: azure,fast-gzip,zstd
 
 jobs:
   check:
