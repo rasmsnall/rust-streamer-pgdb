@@ -142,6 +142,142 @@ class LoadReport:
         nothing can be unexpected.
         """
 
+class TableValidation:
+    """What one source table's validation produced. Instances are immutable.
+
+    A trimmed :class:`TableStats`: no ``batches`` or ``delta_version``, since
+    :func:`validate_dump` writes nothing.
+    """
+
+    @property
+    def table(self) -> str:
+        """Qualified table name as written in the dump."""
+
+    @property
+    def rows(self) -> int:
+        """Rows decoded from the table's ``COPY`` block."""
+
+    @property
+    def null_substitutions(self) -> dict[str, int]:
+        """``{column: count}`` for values that would be stored as NULL because the Arrow
+        type could not represent them, such as ``infinity`` or ``NaN``."""
+
+    @property
+    def text_fallback_columns(self) -> dict[str, str]:
+        """``{column: declared_type}`` for columns that would be written as text because
+        their declared PostgreSQL type was not recognised."""
+
+class ValidationReport:
+    """The outcome of a completed validation run. Instances are immutable.
+
+    A trimmed :class:`LoadReport`: no ``load_id``, since :func:`validate_dump` writes
+    nothing to a load history.
+    """
+
+    @property
+    def dumped_by(self) -> int:
+        """``pg_dump`` major version that wrote the dump."""
+
+    @property
+    def from_database(self) -> int | None:
+        """Source server major version, when the preamble stated one."""
+
+    @property
+    def compression(self) -> str:
+        """Compression detected on the input, or ``"none"``."""
+
+    @property
+    def bytes_read(self) -> int:
+        """Bytes taken from the input, counted before decompression."""
+
+    @property
+    def total_rows(self) -> int:
+        """Rows decoded across every validated table."""
+
+    @property
+    def tables(self) -> list[TableValidation]:
+        """One entry per validated table, in the order their blocks closed."""
+
+    @property
+    def missing_tables(self) -> list[str]:
+        """Expected names the dump did not contain, sorted. Empty unless
+        ``expect_tables`` or ``tables`` was given."""
+
+    @property
+    def unexpected_tables(self) -> list[str]:
+        """Names the dump contained that ``expect_tables`` did not list, sorted. Always
+        empty when ``expect_tables`` was not given."""
+
+def validate_dump(
+    dump_path: str | PathLike[str],
+    *,
+    output_uri: str | None = ...,
+    tables: Sequence[str] | None = ...,
+    excluded_schemas: Sequence[str] | None = ...,
+    wide_numeric_as_decimal: bool = ...,
+    native_arrays: bool = ...,
+    expect_pg_major: int | None = ...,
+    expect_tables: Sequence[str] | None = ...,
+    max_field_bytes: int | None = ...,
+    max_row_bytes: int | None = ...,
+    max_columns: int | None = ...,
+    progress: Callable[[ProgressEvent], Any] | None = ...,
+) -> ValidationReport:
+    """Validate a ``pg_dump`` plain-text file the way :func:`stream_dump_to_delta` would,
+    without writing anything.
+
+    Runs the same structural, type-fidelity and path-traversal checks a real load applies
+    before it ever opens a Delta table: a truncated ``COPY`` block, a row whose field
+    count disagrees with its header, a value that contradicts its declared type, non-UTF-8
+    text, a ``numeric`` too wide for its column, an unqualified or mismatched ``pg_dump``
+    major, and a table name that would escape the output prefix. ``infinity``, ``NaN``,
+    and an unrecognised type are reported, not failed, exactly as a real load reports
+    them.
+
+    Runs entirely on the calling thread: no worker pool, no Arrow, no Delta, no object
+    store is touched, so this is meant to finish in seconds to low minutes even on a large
+    dump, and can run on a much smaller machine than the real load needs.
+
+    This cannot catch schema drift against an existing Delta table (there is no target
+    here to compare against) or a target that is unreachable, since none is opened. Run
+    :func:`stream_dump_to_delta` itself to learn either.
+
+    Parameters
+    ----------
+    dump_path:
+        A local path to the dump. Unlike :func:`stream_dump_to_delta`, cloud object
+        storage and ``file://`` URLs are not supported: supporting them would require the
+        async machinery this function deliberately does not carry. gzip is decompressed
+        transparently; zstd too, if the wheel was built with the ``zstd`` feature.
+    output_uri:
+        The prefix a real load would write beneath. When given, checked against Unity
+        Catalog managed storage and the legacy Hive warehouse, the same rejection
+        :func:`stream_dump_to_delta` applies. Purely a string check: no object store is
+        opened. ``None`` skips it.
+    tables, excluded_schemas, wide_numeric_as_decimal, native_arrays, expect_pg_major,
+    expect_tables, max_field_bytes, max_row_bytes, max_columns:
+        Exactly as on :func:`stream_dump_to_delta`.
+    progress:
+        Called with a :class:`ProgressEvent` after each chunk and each table. Raising
+        from it, or a Ctrl-C, aborts validation; the exception you raised is the one that
+        propagates.
+
+    Returns
+    -------
+    ValidationReport
+
+    Raises
+    ------
+    ValueError
+        Everything :func:`stream_dump_to_delta` raises ``ValueError`` for, except a
+        schema change under ``append`` mode, which needs an existing Delta table to
+        compare against.
+    OSError
+        The dump could not be read.
+    KeyboardInterrupt
+        Validation was interrupted.
+    """
+
 def stream_dump_to_delta(
     dump_path: str | PathLike[str],
     output_uri: str,
@@ -282,4 +418,8 @@ def stream_dump_to_delta(
     is microseconds UTC: naive timestamps are therefore assumed to be UTC. Delta
     ``timestamp_ntz`` would raise the table's protocol version above the compatibility
     floor this library targets, so it is not used.
+
+    For a large dump, consider calling :func:`validate_dump` first: it runs the same
+    structural and type checks in seconds to low minutes, without spinning up a cluster
+    or writing anything, so a malformed dump is caught before the expensive part starts.
     """

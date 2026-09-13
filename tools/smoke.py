@@ -186,6 +186,61 @@ def main() -> int:
     # A quoted non-ASCII name must survive as a path component.
     check((out / "public" / "Räksmörgås").is_dir(), "non-ASCII table path missing")
 
+    # --- validate_dump: the same dump, without writing anything ----------------------
+    validation = pgdelta.validate_dump(dump_path, expect_pg_major=17)
+    print("validation:", validation)
+    by_validated = {t.table: t for t in validation.tables}
+    check(set(by_validated) == set(EXPECTED_TABLES), f"tables were {sorted(by_validated)}")
+    for name, rows in EXPECTED_TABLES.items():
+        check(
+            by_validated[name].rows == rows,
+            f"validated {name} had {by_validated[name].rows} rows, want {rows}",
+        )
+    check(
+        by_validated["public.oddities"].text_fallback_columns.get("kind") == "mystery_enum",
+        "validate_dump did not report the unrecognised type",
+    )
+    check(
+        by_validated["public.Räksmörgås"].null_substitutions.get("born") == 1,
+        "validate_dump did not count the infinity substitution",
+    )
+    check(validation.compression == "gzip", f"validate_dump compression was {validation.compression}")
+    check(validation.dumped_by == 17, "validate_dump did not recover the pg_dump major")
+    check(
+        validation.bytes_read == dump_path.stat().st_size,
+        f"validate_dump bytes_read {validation.bytes_read} != gzip size {dump_path.stat().st_size}",
+    )
+
+    # A dump validate_dump would accept must still be one stream_dump_to_delta accepts:
+    # the two must not have drifted apart. Loads into a separate directory so this run
+    # does not disturb the report already checked above.
+    revalidate_dir = tmp / "revalidate"
+    revalidate_dir.mkdir()
+    reloaded = pgdelta.stream_dump_to_delta(
+        dump_path,
+        f"file://{revalidate_dir.as_posix()}",
+        mode="overwrite",
+        expect_pg_major=17,
+    )
+    check(
+        reloaded.total_rows == validation.total_rows,
+        f"validate_dump reported {validation.total_rows} rows, load reported {reloaded.total_rows}",
+    )
+
+    # A dump with an unqualified major must be refused, the same as a real load; the
+    # Rust-level differential test (tests/validate_matches_load.rs) is what checks this
+    # against stream_dump_to_delta case by case, so this is just confirming the compiled
+    # binding surfaces it as a ValueError like everything else validate_dump raises.
+    bad_major = DUMP.replace("pg_dump version 17.4", "pg_dump version 18.0")
+    bad_major_path = tmp / "bad_major.sql"
+    bad_major_path.write_text(bad_major, encoding="utf-8")
+    try:
+        pgdelta.validate_dump(bad_major_path, expect_pg_major=17)
+    except ValueError:
+        pass
+    else:
+        raise SystemExit("FAIL: validate_dump accepted an unqualified pg_dump major")
+
     try:
         from deltalake import DeltaTable
     except ImportError:

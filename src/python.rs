@@ -18,6 +18,7 @@ use crate::copy::Limits;
 use crate::error::Error;
 use crate::pipeline::{self, LoadConfig, LoadReport, Progress, TableStats};
 use crate::sink::WriteMode;
+use crate::validate::{self, TableValidation, ValidateConfig, ValidationReport};
 
 create_exception!(
     _pgdelta,
@@ -33,8 +34,11 @@ create_exception!(
 /// Registers everything the extension module exposes.
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(stream_dump_to_delta, module)?)?;
+    module.add_function(wrap_pyfunction!(validate_dump, module)?)?;
     module.add_class::<PyLoadReport>()?;
     module.add_class::<PyTableStats>()?;
+    module.add_class::<PyValidationReport>()?;
+    module.add_class::<PyTableValidation>()?;
     module.add(
         "PartialCommitError",
         module.py().get_type::<PartialCommitError>(),
@@ -43,8 +47,11 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
         "__all__",
         (
             "stream_dump_to_delta",
+            "validate_dump",
             "LoadReport",
             "TableStats",
+            "ValidationReport",
+            "TableValidation",
             "PartialCommitError",
         ),
     )?;
@@ -339,6 +346,10 @@ fn parse_mode(mode: &str) -> PyResult<WriteMode> {
 /// is microseconds UTC: naive timestamps are therefore assumed to be UTC. Delta
 /// ``timestamp_ntz`` would raise the table's protocol version above the compatibility
 /// floor this library targets, so it is not used.
+///
+/// For a large dump, consider calling ``validate_dump`` first: it runs the same
+/// structural and type checks in seconds to low minutes, without spinning up a cluster
+/// or writing anything, so a malformed dump is caught before the expensive part starts.
 #[pyfunction]
 #[pyo3(signature = (
     dump_path,
@@ -470,6 +481,242 @@ fn stream_dump_to_delta(
 
     Ok(PyLoadReport {
         load_id: report.load_id,
+        missing_tables: report.missing_tables,
+        unexpected_tables: report.unexpected_tables,
+        dumped_by: report.dumped_by,
+        from_database: report.from_database,
+        compression: report.compression.to_string(),
+        bytes_read: report.bytes_read,
+        total_rows: report.total_rows,
+        tables,
+    })
+}
+
+/// Per-table result, mirroring [`TableValidation`].
+#[pyclass(name = "TableValidation", frozen, get_all)]
+pub struct PyTableValidation {
+    /// Qualified table name as written in the dump.
+    table: String,
+    /// Rows decoded from the table's `COPY` block.
+    rows: u64,
+    /// `{column: count}` for values that would be stored as NULL because the type
+    /// cannot hold them.
+    null_substitutions: HashMap<String, u64>,
+    /// `{column: declared_type}` for columns that would be written as text because the
+    /// type was not recognised.
+    text_fallback_columns: HashMap<String, String>,
+}
+
+#[pymethods]
+impl PyTableValidation {
+    fn __repr__(&self) -> String {
+        format!(
+            "TableValidation(table={:?}, rows={})",
+            self.table, self.rows
+        )
+    }
+}
+
+impl From<TableValidation> for PyTableValidation {
+    fn from(s: TableValidation) -> Self {
+        Self {
+            table: s.table,
+            rows: s.rows,
+            null_substitutions: s.null_substitutions.into_iter().collect(),
+            text_fallback_columns: s.text_fallback_columns.into_iter().collect(),
+        }
+    }
+}
+
+/// Whole-run result, mirroring [`ValidationReport`].
+#[pyclass(name = "ValidationReport", frozen, get_all)]
+pub struct PyValidationReport {
+    /// `pg_dump` major version that wrote the dump.
+    dumped_by: u32,
+    /// Source server major version, when the preamble stated one.
+    from_database: Option<u32>,
+    /// Compression detected on the input, or `"none"`.
+    compression: String,
+    /// Bytes taken from the input, counted before decompression.
+    bytes_read: u64,
+    /// Rows decoded across every validated table.
+    total_rows: u64,
+    /// One [`PyTableValidation`] per validated table, in the order their blocks closed.
+    tables: Vec<Py<PyTableValidation>>,
+    /// Expected names the dump did not contain. Empty unless ``expect_tables`` or
+    /// ``tables`` was given.
+    missing_tables: Vec<String>,
+    /// Names the dump contained that ``expect_tables`` did not list. Always empty unless
+    /// ``expect_tables`` was given.
+    unexpected_tables: Vec<String>,
+}
+
+#[pymethods]
+impl PyValidationReport {
+    fn __repr__(&self) -> String {
+        format!(
+            "ValidationReport(dumped_by={}, tables={}, total_rows={})",
+            self.dumped_by,
+            self.tables.len(),
+            self.total_rows
+        )
+    }
+}
+
+/// Validate a ``pg_dump`` plain-text file the way ``stream_dump_to_delta`` would, without
+/// writing anything.
+///
+/// Runs the same structural, type-fidelity and path-traversal checks a real load applies
+/// before it ever opens a Delta table: a truncated ``COPY`` block, a row whose field count
+/// disagrees with its header, a value that contradicts its declared type, non-UTF-8 text,
+/// a ``numeric`` too wide for its column, an unqualified or mismatched ``pg_dump`` major,
+/// and a table name that would escape the output prefix. ``infinity``, ``NaN``, and an
+/// unrecognised type are reported, not failed, exactly as a real load reports them.
+///
+/// Runs entirely on the calling thread: no worker pool, no Arrow, no Delta, no object
+/// store is touched, so this is meant to finish in seconds to low minutes even on a large
+/// dump, and can run on a much smaller machine than the real load needs.
+///
+/// This cannot catch schema drift against an existing Delta table (there is no target
+/// here to compare against) or a target that is unreachable, since none is opened. Run
+/// ``stream_dump_to_delta`` itself to learn either. Unlike ``stream_dump_to_delta``,
+/// ``dump_path`` here must be a local path: cloud object storage and ``file://`` URLs are
+/// not supported, since supporting them would require the async machinery this function
+/// deliberately does not carry.
+///
+/// Parameters
+/// ----------
+/// dump_path : str | os.PathLike
+///     A local path to the dump. gzip is decompressed transparently; zstd too, if the
+///     wheel was built with the ``zstd`` feature.
+/// output_uri : str | None
+///     The prefix a real load would write beneath. When given, checked against Unity
+///     Catalog managed storage and the legacy Hive warehouse, the same rejection
+///     ``stream_dump_to_delta`` applies, so that mistake is caught here too. Purely a
+///     string check: no object store is opened. ``None`` skips it.
+/// tables, excluded_schemas, wide_numeric_as_decimal, native_arrays, expect_pg_major,
+/// expect_tables, max_field_bytes, max_row_bytes, max_columns :
+///     Exactly as on ``stream_dump_to_delta``.
+/// progress : callable | None
+///     Called with a dict ``{bytes_read, rows, tables_done, table}`` after each chunk and
+///     each table. Raising from it, or a Ctrl-C, aborts validation; the exception raised
+///     is the one that propagates.
+///
+/// Returns
+/// -------
+/// ValidationReport
+///     Per-table row counts and the substitutions and unrecognised types that would be
+///     reported, and the ``pg_dump`` and source-server versions from the preamble.
+///
+/// Raises
+/// ------
+/// ValueError
+///     Everything ``stream_dump_to_delta`` raises ``ValueError`` for, except a schema
+///     change under ``append`` mode, which needs an existing Delta table to compare
+///     against.
+/// OSError
+///     The dump could not be read.
+/// KeyboardInterrupt
+///     Validation was interrupted.
+#[pyfunction]
+#[pyo3(signature = (
+    dump_path,
+    *,
+    output_uri = None,
+    tables = None,
+    excluded_schemas = None,
+    wide_numeric_as_decimal = false,
+    native_arrays = false,
+    expect_pg_major = None,
+    expect_tables = None,
+    max_field_bytes = None,
+    max_row_bytes = None,
+    max_columns = None,
+    progress = None,
+))]
+#[allow(clippy::too_many_arguments)]
+fn validate_dump(
+    py: Python<'_>,
+    dump_path: &Bound<'_, PyAny>,
+    output_uri: Option<String>,
+    tables: Option<Vec<String>>,
+    excluded_schemas: Option<Vec<String>>,
+    wide_numeric_as_decimal: bool,
+    native_arrays: bool,
+    expect_pg_major: Option<u32>,
+    expect_tables: Option<Vec<String>>,
+    max_field_bytes: Option<usize>,
+    max_row_bytes: Option<usize>,
+    max_columns: Option<usize>,
+    progress: Option<Py<PyAny>>,
+) -> PyResult<PyValidationReport> {
+    let dump_path: std::path::PathBuf = match dump_path.extract::<std::path::PathBuf>() {
+        Ok(path) => path,
+        Err(_) => std::path::PathBuf::from(dump_path.extract::<String>()?),
+    };
+
+    let defaults = Limits::default();
+    let config = ValidateConfig {
+        tables,
+        excluded_schemas,
+        wide_numeric_as_decimal,
+        native_arrays,
+        expect_pg_major,
+        expect_tables,
+        output_uri,
+        limits: Limits {
+            max_field_bytes: max_field_bytes.unwrap_or(defaults.max_field_bytes),
+            max_row_bytes: max_row_bytes.unwrap_or(defaults.max_row_bytes),
+            max_columns: max_columns.unwrap_or(defaults.max_columns),
+        },
+    };
+
+    // Same pattern as stream_dump_to_delta: the callback runs on the calling thread with
+    // the GIL held, checks for a pending signal so Ctrl-C works, and restores whatever it
+    // raised as the pending exception so that wins over Error::Interrupted below.
+    let on_progress = |p: Progress| -> bool {
+        Python::attach(|py| {
+            if let Err(err) = py.check_signals() {
+                err.restore(py);
+                return false;
+            }
+            let Some(cb) = progress.as_ref() else {
+                return true;
+            };
+            let payload = PyDict::new(py);
+            let called = payload
+                .set_item("bytes_read", p.bytes_read)
+                .and_then(|()| payload.set_item("rows", p.rows))
+                .and_then(|()| payload.set_item("tables_done", p.tables_done))
+                .and_then(|()| payload.set_item("table", p.table))
+                .and_then(|()| cb.call1(py, (payload,)).map(|_| ()));
+            match called {
+                Ok(()) => true,
+                Err(err) => {
+                    err.restore(py);
+                    false
+                }
+            }
+        })
+    };
+
+    // Released even though this is single-threaded and typically fast: a large dump can
+    // still take real wall-clock time at decode-only speed, and other Python threads
+    // should not stall for it.
+    let outcome = py.detach(|| validate::validate_file(&dump_path, &config, on_progress));
+
+    if let Some(err) = PyErr::take(py) {
+        return Err(err);
+    }
+    let report: ValidationReport = outcome.map_err(|err| to_pyerr(py, err))?;
+
+    let tables = report
+        .tables
+        .into_iter()
+        .map(|t| Py::new(py, PyTableValidation::from(t)))
+        .collect::<PyResult<Vec<_>>>()?;
+
+    Ok(PyValidationReport {
         missing_tables: report.missing_tables,
         unexpected_tables: report.unexpected_tables,
         dumped_by: report.dumped_by,

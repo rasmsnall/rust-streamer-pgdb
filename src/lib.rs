@@ -36,6 +36,7 @@ pub mod scan;
 pub mod sink;
 pub mod source;
 pub mod types;
+pub mod validate;
 pub mod values;
 
 pub use error::{Error, Result};

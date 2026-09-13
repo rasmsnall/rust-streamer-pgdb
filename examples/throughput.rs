@@ -6,7 +6,13 @@
 //!
 //! ```text
 //! cargo run --release --example throughput
+//! cargo run --release --features zstd --example throughput
 //! ```
+//!
+//! The second form adds a zstd measurement alongside gzip's, for comparing the two
+//! formats' decompression rate: decompression is the pipeline's serial floor (see
+//! `src/dump.rs`), so this is the number that matters most for a sender who can be
+//! persuaded to switch compression.
 
 use std::hint::black_box;
 use std::time::Instant;
@@ -150,12 +156,46 @@ fn main() {
     let gunzip = t.elapsed().as_secs_f64();
     assert_eq!(inflated, data.len());
 
+    // zstd, at its default level, for comparison against gzip: only meaningful when
+    // built with the `zstd` feature, since that is what makes this crate able to decode
+    // it at all. Compression itself needs no feature (this crate never compresses), so
+    // the comparison is available even without the feature; only the "decompress through
+    // this crate's own decompressed()" half is feature-gated.
+    #[cfg(feature = "zstd")]
+    let (zstd_size, zstd_seconds) = {
+        let z = zstd::stream::encode_all(data.as_slice(), 0).unwrap();
+        let t = Instant::now();
+        let (_, reader) = decompressed(std::io::Cursor::new(z.clone())).unwrap();
+        let mut cr = ChunkReader::new(reader);
+        let mut inflated = 0usize;
+        while let Some(chunk) = cr.next_chunk().unwrap() {
+            inflated += chunk.len();
+            black_box(chunk);
+        }
+        assert_eq!(inflated, data.len());
+        (z.len(), t.elapsed().as_secs_f64())
+    };
+
     println!("input            {mib:.0} MiB, {count} rows");
     println!(
         "gzip size        {:.0} MiB  ({ratio:.1}x)",
         gz.len() as f64 / (1024.0 * 1024.0)
     );
     println!("gunzip+chunk     {gunzip:.3} s   {:.0} MiB/s", mib / gunzip);
+    #[cfg(feature = "zstd")]
+    {
+        let zstd_ratio = bytes / zstd_size as f64;
+        println!(
+            "zstd size        {:.0} MiB  ({zstd_ratio:.1}x)",
+            zstd_size as f64 / (1024.0 * 1024.0)
+        );
+        println!(
+            "unzstd+chunk     {zstd_seconds:.3} s   {:.0} MiB/s",
+            mib / zstd_seconds
+        );
+    }
+    #[cfg(not(feature = "zstd"))]
+    println!("unzstd+chunk     (build with --features zstd to measure)");
     println!("decode           {decode:.3} s   {:.0} MiB/s", mib / decode);
     println!("scan             {scan:.3} s   {:.0} MiB/s", mib / scan);
     println!("rows passed on   {} MiB", scanned / (1024 * 1024));
@@ -172,4 +212,16 @@ fn main() {
         491520.0 / gz_rate / 60.0,
         491520.0 / dec_rate / 60.0
     );
+    #[cfg(feature = "zstd")]
+    {
+        let zstd_rate = mib / zstd_seconds;
+        println!(
+            "48 GB:  unzstd {:.1} min (serial floor)",
+            49152.0 / zstd_rate / 60.0
+        );
+        println!(
+            "480 GB: unzstd {:.1} min (serial floor)",
+            491520.0 / zstd_rate / 60.0
+        );
+    }
 }

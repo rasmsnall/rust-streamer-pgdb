@@ -13,8 +13,20 @@
 //! scale with cores, and it sits in front of every other stage. It therefore governs
 //! total runtime. Measured gunzip throughput is 349 MiB/s against a row decoder at
 //! 1068 MiB/s per core, so with gzip input this stage, not the decoder, sets the pace.
-//! Build with the `zlib-ng` feature where a C toolchain is available; it is materially
+//! Build with the `fast-gzip` feature where a C toolchain is available; it is materially
 //! faster and no amount of parallelism elsewhere compensates for a slow decompressor.
+//!
+//! zstd is a candidate for a faster serial floor, but **measure before asking the sender
+//! to switch**: on one development machine, zstd's default level decoded only around 20%
+//! faster than gzip's default (pure-Rust) backend, not the large multiple sometimes
+//! assumed, and its ratio at that level was marginally worse. Run
+//! `cargo run --release --features zstd --example throughput` on hardware representative
+//! of the real driver before treating either number as a reason to change anything; see
+//! the module doc's own warning about unrepresentative fixtures for why a number from the
+//! wrong machine or the wrong data shape is worse than no number. The format is
+//! recognised by magic bytes regardless of whether the feature is compiled in, so a
+//! sender switching format without notice fails with a precise
+//! [`Error::UnsupportedCompression`] rather than a corrupt parse.
 //!
 //! # Chunk alignment
 //!
@@ -33,8 +45,9 @@ pub enum Compression {
     None,
     /// gzip, as produced by `pg_dump -Z`.
     Gzip,
-    /// zstd. Recognised so that it produces a precise error rather than a corrupt parse,
-    /// but not decoded: support is not compiled in.
+    /// zstd. Always recognised by magic bytes; decoded only when built with the `zstd`
+    /// feature, so that an unbuilt format produces a precise error rather than a corrupt
+    /// parse.
     Zstd,
 }
 
@@ -84,7 +97,7 @@ fn read_head<R: Read>(r: &mut R, buf: &mut [u8]) -> Result<usize> {
 /// # Errors
 ///
 /// [`Error::UnsupportedCompression`] for a format that is recognised but not compiled
-/// in, and [`Error::Io`] for a read failure.
+/// in (zstd, unless built with the `zstd` feature), and [`Error::Io`] for a read failure.
 ///
 /// # Panics
 ///
@@ -101,6 +114,14 @@ pub fn decompressed<R: Read + 'static>(mut inner: R) -> Result<(Compression, Box
         // stop silently at the end of its first member, which is a truncated load
         // reported as success.
         Compression::Gzip => Box::new(flate2::read::MultiGzDecoder::new(stream)),
+        #[cfg(feature = "zstd")]
+        Compression::Zstd => {
+            // zstd::Decoder concatenates frames until EOF by default (mirroring
+            // MultiGzDecoder above), so a multi-frame archive is read in full rather than
+            // stopping after the first frame.
+            Box::new(zstd::stream::read::Decoder::new(stream)?)
+        }
+        #[cfg(not(feature = "zstd"))]
         Compression::Zstd => {
             return Err(Error::UnsupportedCompression {
                 format: compression.name().to_string(),
@@ -289,6 +310,7 @@ mod tests {
         assert_eq!(got, b"first\nsecond\n");
     }
 
+    #[cfg(not(feature = "zstd"))]
     #[test]
     fn zstd_is_recognised_and_refused_precisely() {
         // `Box<dyn Read>` is not `Debug`, so the Ok arm cannot be unwrapped away.
@@ -301,6 +323,51 @@ mod tests {
                 format: "zstd".into()
             }
         );
+    }
+
+    #[cfg(feature = "zstd")]
+    fn zstd(data: &[u8]) -> Vec<u8> {
+        zstd::stream::encode_all(data, 0).unwrap()
+    }
+
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn zstd_round_trips() {
+        let data: Vec<u8> = (0..5000)
+            .map(|i| format!("row {i}\n"))
+            .collect::<String>()
+            .into();
+        let (c, mut r) = decompressed(Cursor::new(zstd(&data))).unwrap();
+        assert_eq!(c, Compression::Zstd);
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        assert_eq!(got, data);
+    }
+
+    /// Mirrors `concatenated_gzip_members_are_all_read`: a sender using a multi-frame
+    /// zstd archive (as `zstd --long` or a parallel compressor might produce) must be
+    /// read in full rather than stopping after the first frame.
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn concatenated_zstd_frames_are_all_read() {
+        let mut archive = zstd(b"first\n");
+        archive.extend_from_slice(&zstd(b"second\n"));
+        let (_, mut r) = decompressed(Cursor::new(archive)).unwrap();
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"first\nsecond\n");
+    }
+
+    /// Even with the feature compiled in, a genuinely corrupt zstd frame must fail the
+    /// load rather than silently yielding a short read.
+    #[cfg(feature = "zstd")]
+    #[test]
+    fn corrupt_zstd_input_is_an_io_error() {
+        let mut archive = zstd(b"first\n");
+        archive.truncate(archive.len() - 2);
+        let (_, mut r) = decompressed(Cursor::new(archive)).unwrap();
+        let mut got = Vec::new();
+        assert!(r.read_to_end(&mut got).is_err());
     }
 
     #[test]

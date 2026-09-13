@@ -4,8 +4,8 @@
 **Status** Complete. Describes the system as built.
 **Audience** Whoever runs the daily load and is paged when it fails.
 **Companion documents** `architecture.md` for the design, `api.md` for the callable surface.
-**Version** 1.0
-**Date** 2026-09-10
+**Version** 1.2
+**Date** 2026-09-13
 
 ---
 
@@ -19,6 +19,7 @@
   - 2. Installing on Databricks
   - 3. Where output may be written
   - 4. The compatibility floor
+  - 5. Pre-flight validation
 - III. Sizing
   - 1. What scales and what does not
   - 2. Memory
@@ -107,10 +108,16 @@ architectures.
 The release profile enables thin LTO and a single codegen unit. A debug build decodes
 roughly an order of magnitude slower and is not representative of anything.
 
-Two optional features exist. `fast-gzip` selects the zlib-ng backend, which is materially
-faster but requires a C toolchain and cmake at build time; it is worth enabling only if
-the feed is gzipped. `azure` adds the object-store backend needed for `abfss://` output. A
-`/Volumes` FUSE path needs neither.
+Three optional features exist. `fast-gzip` selects the zlib-ng backend, which is
+materially faster but requires a C toolchain and cmake at build time; it is worth
+enabling only if the feed is gzipped. `zstd` decodes a zstd-compressed dump, needing a C
+toolchain but not cmake; without it, a zstd dump is recognised by its magic bytes and
+fails the load with a precise error rather than being misread. `azure` adds the
+object-store backend needed for `abfss://` output. A `/Volumes` FUSE path needs none of
+the three.
+
+Whether switching the feed's compression from gzip to zstd is worth doing is a measured
+question, not a settled one: see Chapter III, Section 4.
 
 ### 2. Installing on Databricks
 
@@ -158,6 +165,33 @@ raise the default silently.
 The visible cost is that naive PostgreSQL timestamps are assumed to be UTC rather than
 written as `timestamp_ntz`, which would require reader version 3 and writer version 7. See
 `api.md`, Chapter V, Section 4.
+
+### 5. Pre-flight validation
+
+`pgdelta.validate_dump` runs the same structural, type-fidelity and path-traversal checks
+`stream_dump_to_delta` applies, without writing anything: no Arrow, no Delta, no object
+store, no worker pool. It finishes in seconds to low minutes even on the full-sized daily
+dump, on a much smaller machine than the real load needs, because decoding alone (what
+this checks) was measured as the least expensive stage of the pipeline; see
+`architecture.md`, Chapter III, Section 2 and Chapter IV, Section 3.
+
+The daily job's real cost is the driver time in Chapter III below. A structural problem in
+the dump, a truncated transfer, a value that contradicts its own DDL, an unqualified
+`pg_dump` major, is otherwise discovered only after most or all of that time has been
+spent. Run it as a small, cheap job task ahead of the real load, or as a first step in the
+same job before the cluster does the expensive part:
+
+```python
+import pgdelta
+
+validation = pgdelta.validate_dump("/Volumes/main/landing/pg/day.sql", expect_pg_major=17)
+print(f"{validation.total_rows:,} rows across {len(validation.tables)} tables would load")
+```
+
+It cannot catch schema drift against the Delta tables already at `output_uri`, since there
+is no target here to compare against, nor can it know whether that target is reachable,
+since none is opened. Both still need the real load to learn. See `api.md`, Chapter II,
+Section 7.
 
 ---
 
@@ -248,6 +282,15 @@ single-core ceiling and to absorb a future format change, not because decoding i
 With plain input, which is what the current feed delivers, the decompression stage
 disappears entirely and Parquet encoding becomes the constraint, which is exactly the
 stage the worker pool parallelises.
+
+zstd (behind the `zstd` feature; see Chapter II, Section 1) is a candidate for a faster
+serial floor if the feed is ever compressed. **Measure before asking the sender to
+switch**, on hardware representative of the actual driver: on one development machine,
+zstd's default level decoded only around 20% faster than gzip's default backend, not the
+large multiple sometimes assumed, and compressed marginally worse at that level.
+`cargo run --release --features zstd --example throughput` measures both side by side.
+A number from a laptop is not evidence about the driver; re-measure there before it
+informs a change to the feed.
 
 ### 5. Choosing a driver
 
@@ -572,6 +615,10 @@ import pgdelta
 DUMP = "/Volumes/main/landing/pg/day.sql"
 OUTPUT = "/Volumes/main/raw/pg/"
 
+# Optional, and cheap: catches a truncated transfer or a structural problem in seconds,
+# before the cluster spends real time on it. See Chapter II, Section 5.
+pgdelta.validate_dump(DUMP, expect_pg_major=17)
+
 report = pgdelta.stream_dump_to_delta(
     DUMP,
     OUTPUT,
@@ -614,5 +661,5 @@ Stated plainly, so that nobody discovers them during an incident.
 | Row order within a table is not preserved | Any consumer relying on insertion order breaks | Sort downstream. Delta tables are unordered sets |
 | Registering in Unity Catalog needs a Spark session | delta-rs cannot call a catalog | `pgdelta.catalog.register_external_tables`. See Appendix D |
 | The load history grows without bound | One row per table per run, so a few hundred a day | Small, but prune it if a year of history is not wanted |
-| zstd input is rejected rather than decoded | A format change by the sender fails the load | Add the crate and a match arm before agreeing to any such change |
+| zstd input needs the optional `zstd` feature to decode | Without it, a zstd dump is recognised and fails precisely rather than being misread | Build with `--features zstd`; measure first, see Chapter III, Section 4 |
 | Single-node only | Ceiling in the high hundreds of gigabytes | See `architecture.md`, Chapter IV, Section 8 |

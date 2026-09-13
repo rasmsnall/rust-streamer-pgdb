@@ -4,8 +4,8 @@
 **Status** Complete and implemented. The pipeline runs end to end, decoding in parallel, behind both the Rust and the Python surface.
 **Audience** Anyone integrating, operating, or modifying this library. No prior context assumed.
 **Companion documents** `api.md` for the callable surface, `operations.md` for running it.
-**Version** 1.1
-**Date** 2026-09-10
+**Version** 1.3
+**Date** 2026-09-13
 
 ---
 
@@ -25,6 +25,7 @@
   - 4. Decode
   - 5. Type mapping and array building
   - 6. Write
+  - 7. Validation without writing
 - IV. Concurrency Model
   - 1. Execution model by component
   - 2. Rationale for the division
@@ -233,15 +234,25 @@ than misread. Three outcomes are possible:
 - `1f 8b`, gzip, is decoded. `MultiGzDecoder` is used rather than `GzDecoder`, because a
   concatenated archive would otherwise stop silently at the end of its first member,
   which is a truncated load reported as success.
-- `28 b5 2f fd`, zstd, is **recognised but not decoded**, and fails the load with a
-  precise error. Support is not compiled in, and recognising the format is what turns a
-  corrupt parse into a clear message.
+- `28 b5 2f fd`, zstd, is **always recognised**, and decoded when built with the optional
+  `zstd` feature; without that feature it fails the load with a precise error rather than
+  a corrupt parse. `zstd::stream::read::Decoder` concatenates frames until EOF by
+  default, the same guarantee `MultiGzDecoder` gives gzip, so a multi-frame archive is
+  read in full.
 - Anything else is treated as plain text, which is what the current feed delivers.
 
 Note the asymmetry: an *unrecognised* format is assumed to be plain text and will fail
-later in the scanner, whereas a *recognised but unsupported* one fails immediately. Adding
-zstd is a small change (one crate and one match arm), and should be made before asking the
-sender to switch, not after.
+later in the scanner, whereas a *recognised but unsupported* one (zstd without the
+feature) fails immediately.
+
+zstd is a candidate for a faster serial floor than gzip, but **measure before asking a
+sender to switch**: on one development machine, zstd's default level decoded only around
+20% faster than gzip's default (pure-Rust) backend, not the large multiple sometimes
+assumed, and its ratio at that level was marginally worse. A number from the wrong
+machine is not a smaller version of the right answer, it is a different answer, exactly
+as `examples/throughput.rs`'s own fixture-entropy warning says about measuring the wrong
+*data* shape. Run `cargo run --release --features zstd --example throughput` on hardware
+representative of the real driver before deciding either way.
 
 **Decompression is the pipeline's only unavoidable serial stage.** A compressed stream
 must be decoded in order, so unlike row decoding it does not scale with cores, and it
@@ -293,6 +304,24 @@ appended into Arrow column builders, producing `RecordBatch` values bounded by
 
 Batches are encoded to Parquet and written through delta-rs.
 
+Parquet encoding runs with [`sink::writer_properties`], not delta-rs's own default.
+delta-rs sets only the codec (`SNAPPY`, kept as-is here: it is already the fast end of
+the encode-CPU/output-size trade-off, the right side of that trade-off for a bottleneck
+that is CPU-bound rather than storage-bound) and leaves `parquet`'s own default
+statistics granularity, `EnabledStatistics::Page`: a min/max/null-count recomputed for
+every page, roughly every megabyte of column data. That is real CPU cost on this stage,
+the pipeline's second-ranked bottleneck (Section 2 above and Chapter IV, Section 3), and
+it buys nothing here: Delta's own file-skipping statistics, the ones a query engine
+actually prunes on, are computed separately from the Arrow `RecordBatch` by delta-rs's
+writer (`writer::stats::create_add`), not derived from Parquet's own embedded
+statistics. `writer_properties` lowers this to `EnabledStatistics::Chunk`, one
+min/max/null-count per row group rather than per page: still enough for a Parquet reader
+doing its own row-group-level pruning, but without the finer-grained page-level
+`ColumnIndex`/`OffsetIndex` structures nothing in this pipeline's own read or write path
+uses. Verified structurally rather than assumed: a test builds one file at each setting
+and asserts the page-level one populates a real `ColumnIndex` entry while the
+chunk-level one carries the `NONE` placeholder, with chunk statistics present in both.
+
 Note that `batch_bytes` bounds the *in-memory Arrow batch*, not the output file. Several
 batches accumulate into each Parquet file, targeting roughly 256 MB to 1 GB written.
 Emitting one small file per batch across hundreds of tables produces small-file sprawl
@@ -321,6 +350,41 @@ constructor that resolves its own store from a URI, with no way to hand it one, 
 writer still resolves independently. Because chunk dispatch keeps a table that fits in one
 chunk on a single worker (Chapter IV, Section 3), this is one writer per table for the
 common case of many small tables, not one per worker per table.
+
+### 7. Validation without writing
+
+`pgdelta::validate` is a second, lightweight consumer of Sections 2 through 5 above: the
+reader, scanner, decoder and type resolver, driven directly, with no Arrow, no Delta, no
+object store and no worker pool. It exists because Sections 4 and 5 (`types.rs`,
+`values.rs`) were already free of any Arrow or Delta dependency by design, kept apart from
+`builders.rs` specifically so they could be tested without compiling the write path; a
+full-fidelity, decode-only validator follows from that almost for free. It runs single
+threaded and needs no Tokio runtime, since decoding alone was already measured as this
+pipeline's least expensive stage (Chapter IV, Section 3), never mind carrying the
+machinery that exists only to overlap Parquet encoding and commits with it.
+
+It shares, rather than duplicates, everything that is a genuine single source of truth
+elsewhere in the crate: `sink::relative_path` for the path-traversal guard,
+`sink::reject_managed_storage` for the managed-storage check, `manifest::reserved_collision`
+for the load-history name collision, and `builders::as_element` /
+`builders::array_element_type` for `native_arrays` eligibility. The one piece it cannot
+literally share is `builders::ColumnBuilder::append`'s dispatch from a resolved type to
+the matching value parser, because that dispatch is expressed on Arrow-typed builder
+variants; `validate::validate_field` mirrors its shape instead, calling the same
+`values::parse_*` functions. This is the same kind of duplication the codebase already
+tolerates between `builders::arrow_type` and `builders::ColumnBuilder::new` (see Section
+5), and is guarded the same way: a differential test
+(`tests/validate_matches_load.rs`) runs a shared set of fixtures through both `validate`
+and `pipeline::run` and asserts they agree, rather than trusting the mirror by
+inspection alone. One real disagreement was found and fixed this way during development:
+the validator checked `relative_path` before resolving a `COPY` block's columns against
+its `CREATE TABLE`, where the real pipeline resolves columns first, so a `COPY` block for
+an undeclared table produced `UnsafeTableName` in one path and `MalformedCreateTable` in
+the other until the check order was corrected to match.
+
+What it cannot check, and does not claim to: schema drift against an existing Delta
+table, since there is no target to compare against, and whether the object store is
+actually reachable, since none is opened.
 
 ---
 
@@ -848,6 +912,7 @@ actively maintained crates.
 | `deltalake` | 0.32.4 | Delta write path; transitively supplies arrow, parquet, object_store, tokio, chrono | [docs.rs](https://docs.rs/deltalake/0.32.4/deltalake/), [crates.io](https://crates.io/crates/deltalake) |
 | `memchr` | 2.8.3 | SIMD scanning for newlines and tabs in the hot loop | [docs.rs](https://docs.rs/memchr/2.8.3/memchr/), [crates.io](https://crates.io/crates/memchr) |
 | `flate2` | 1.1.10 | gzip decoding. The default backend is pure Rust, so a wheel builds with no C toolchain | [docs.rs](https://docs.rs/flate2/1.1.10/flate2/), [crates.io](https://crates.io/crates/flate2) |
+| `zstd` | 0.13.3 | zstd decoding, behind the optional `zstd` feature. Links libzstd (zstd-sys), needing a C toolchain but not cmake | [docs.rs](https://docs.rs/zstd/0.13.3/zstd/), [crates.io](https://crates.io/crates/zstd) |
 | `tokio` | 1.53.1 | Runtime for the storage edge. Already in the `deltalake` tree; declared so `sink.rs` and `pipeline.rs` may name it | [docs.rs](https://docs.rs/tokio/1.53.1/tokio/), [crates.io](https://crates.io/crates/tokio) |
 | `futures` | 0.3.34 | Stream combinators over the Delta file listing. Already in the `deltalake` tree | [docs.rs](https://docs.rs/futures/0.3.34/futures/), [crates.io](https://crates.io/crates/futures) |
 

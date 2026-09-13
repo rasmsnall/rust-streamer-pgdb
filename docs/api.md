@@ -4,8 +4,8 @@
 **Status** Complete. Describes the surface as built.
 **Audience** Anyone calling this library from Python or from Rust.
 **Companion documents** `architecture.md` for why the design is shaped this way, `operations.md` for running it.
-**Version** 1.0
-**Date** 2026-09-10
+**Version** 1.2
+**Date** 2026-09-13
 
 ---
 
@@ -21,11 +21,14 @@
   - 4. Return value
   - 5. Exceptions
   - 6. The progress callback
+  - 7. `validate_dump`
 - III. Returned Statistics
   - 1. `LoadReport`
   - 2. `TableStats`
   - 3. Reading the statistics
   - 4. A drifting table set
+  - 5. `ValidationReport`
+  - 6. `TableValidation`
 - IV. Rust Surface
   - 1. Entry points
   - 2. `LoadConfig`
@@ -50,8 +53,11 @@
 
 - `<Table 2-1>` Parameters of `stream_dump_to_delta`
 - `<Table 2-2>` Exceptions raised
+- `<Table 2-3>` Parameters of `validate_dump`
 - `<Table 3-1>` Fields of `LoadReport`
 - `<Table 3-2>` Fields of `TableStats`
+- `<Table 3-3>` Fields of `ValidationReport`
+- `<Table 3-4>` Fields of `TableValidation`
 - `<Table 4-1>` Public Rust modules
 - `<Table 5-1>` Write modes
 - `<Table A-1>` Parameter quick reference
@@ -105,9 +111,10 @@ import pgdelta
 pgdelta.stream_dump_to_delta(...)
 ```
 
-The package exports exactly four names: `stream_dump_to_delta`, `LoadReport`,
-`TableStats` and `PartialCommitError`. Type stubs and a `py.typed` marker ship with the
-wheel, so `mypy` and `pyright` resolve the surface without configuration.
+The package exports seven names: `stream_dump_to_delta`, `validate_dump`, `LoadReport`,
+`TableStats`, `ValidationReport`, `TableValidation` and `PartialCommitError`. Type stubs
+and a `py.typed` marker ship with the wheel, so `mypy` and `pyright` resolve the surface
+without configuration.
 
 ### 2. `stream_dump_to_delta`
 
@@ -165,7 +172,7 @@ which is idempotent in `overwrite` mode. See `architecture.md`, Chapter VI, Sect
 
 | Parameter | Type | Default | Meaning |
 |---|---|---|---|
-| `dump_path` | `str` or `os.PathLike` | required | Local path, `file://`, or an object: `abfss://`, `az://`, `gs://`, `s3://`. Read directly, with resume. gzip decoded transparently |
+| `dump_path` | `str` or `os.PathLike` | required | Local path, `file://`, or an object: `abfss://`, `az://`, `gs://`, `s3://`. Read directly, with resume. gzip decoded transparently; zstd too, if the wheel was built with the `zstd` feature, otherwise it fails precisely rather than being misread |
 | `output_uri` | `str` | required | Prefix every table is written beneath |
 | `tables` | `list[str]` or `None` | `None` | Qualified names to load. `None` loads every table in the dump |
 | `excluded_schemas` | `list[str]` or `None` | `None` | PostgreSQL schema (namespace) names to exclude entirely. See Chapter V, Section 2 |
@@ -275,6 +282,55 @@ Decode workers never call it, so it is never invoked concurrently and needs no l
 Returning a value has no effect. To stop a load, raise; the exception propagates as
 described in Section 5, and nothing is committed.
 
+### 7. `validate_dump`
+
+```python
+report = pgdelta.validate_dump(
+    dump_path,
+    *,
+    output_uri=None,
+    tables=None,
+    excluded_schemas=None,
+    wide_numeric_as_decimal=False,
+    native_arrays=False,
+    expect_pg_major=None,
+    expect_tables=None,
+    max_field_bytes=None,
+    max_row_bytes=None,
+    max_columns=None,
+    progress=None,
+)
+```
+
+Runs the same structural, type-fidelity and path-traversal checks `stream_dump_to_delta`
+applies before it ever opens a Delta table, without writing anything: no Arrow, no Delta,
+no object store, no worker pool. It is meant to finish in seconds to low minutes even on
+a large dump, on a much smaller machine than the real load needs, which is the point:
+catch a malformed dump before spending the driver time the real load costs.
+
+`<Table 2-3>` Parameters of `validate_dump`
+
+| Parameter | Type | Default | Meaning |
+|---|---|---|---|
+| `dump_path` | `str` or `os.PathLike` | required | A **local path only**. Unlike `stream_dump_to_delta`, cloud object storage and `file://` URLs are not supported, since supporting them would need the async machinery this function deliberately does not carry. gzip and, if built with the `zstd` feature, zstd are still decompressed transparently |
+| `output_uri` | `str` or `None` | `None` | The prefix a real load would write beneath. When given, checked against Unity Catalog managed storage and the legacy Hive warehouse, the same rejection `stream_dump_to_delta` applies. Purely a string check: no object store is opened |
+| `tables`, `excluded_schemas`, `wide_numeric_as_decimal`, `native_arrays`, `expect_pg_major`, `expect_tables`, `max_field_bytes`, `max_row_bytes`, `max_columns` | | | Exactly as on `stream_dump_to_delta`; see Table 2-1 |
+| `progress` | callable or `None` | `None` | Called after each chunk and each table, in the same shape as Section 6. Raising, or Ctrl-C, aborts validation |
+
+Absent from this call, because they describe *writing*, which never happens here:
+`mode`, `batch_rows`, `batch_bytes`, `threads`, `commit_concurrency`, `storage_options`,
+`write_manifest`.
+
+Returns a `ValidationReport` (Chapter III, Section 5), or raises everything
+`stream_dump_to_delta` raises `ValueError` for (Table 2-2), except a schema change under
+`append` mode, which needs an existing Delta table to compare against and so cannot be
+detected here.
+
+**What this cannot catch.** Schema drift against an existing Delta table: there is no
+target here to compare against. And a target that turns out to be unreachable, since none
+is opened. Both are genuine gaps, not oversights; run `stream_dump_to_delta` itself to
+learn either.
+
 ---
 
 ## III. Returned Statistics
@@ -287,13 +343,13 @@ described in Section 5, and nothing is committed.
 |---|---|---|
 | `dumped_by` | `int` | `pg_dump` major version that wrote the dump, from the preamble |
 | `from_database` | `int` or `None` | Source server major version, when the preamble stated one |
-| `compression` | `str` | Compression decoded off the input: `"none"` or `"gzip"` |
+| `compression` | `str` | Compression decoded off the input: `"none"`, `"gzip"`, or `"zstd"` if the wheel was built with the `zstd` feature |
 | `bytes_read` | `int` | Bytes taken from the input, counted before decompression |
 | `total_rows` | `int` | Rows decoded across every loaded table |
 | `tables` | `list[TableStats]` | One entry per loaded table, in the order their blocks closed |
 | `missing_tables` | `list[str]` | Expected names the dump did not contain |
 | `unexpected_tables` | `list[str]` | Names the dump contained that `expect_tables` did not list |
-| `load_id` | `str` or `None` | Identifies this run's rows in the load history. See Chapter III, Section 7 |
+| `load_id` | `str` or `None` | Identifies this run's rows in the load history. See Chapter V, Section 7 |
 
 Instances are immutable.
 
@@ -373,6 +429,39 @@ all, and that used to be silent.
 Note that a table excluded by the `tables` filter is still *seen*: its `COPY` block is
 scanned past, so its name is known and it is not counted as missing.
 
+### 5. `ValidationReport`
+
+`<Table 3-3>` Fields of `ValidationReport`
+
+| Field | Type | Meaning |
+|---|---|---|
+| `dumped_by` | `int` | `pg_dump` major version that wrote the dump, from the preamble |
+| `from_database` | `int` or `None` | Source server major version, when the preamble stated one |
+| `compression` | `str` | Compression detected on the input: `"none"`, `"gzip"`, or `"zstd"` if the wheel was built with the `zstd` feature |
+| `bytes_read` | `int` | Bytes taken from the input, counted before decompression |
+| `total_rows` | `int` | Rows decoded across every validated table |
+| `tables` | `list[TableValidation]` | One entry per validated table, in the order their blocks closed |
+| `missing_tables` | `list[str]` | Expected names the dump did not contain. See Section 4 |
+| `unexpected_tables` | `list[str]` | Names the dump contained that `expect_tables` did not list |
+
+A trimmed `LoadReport`: no `load_id`, since `validate_dump` writes nothing to a load
+history. Everything else has the identical meaning, and Section 3's reading of
+`null_substitutions` and `text_fallback_columns` (Section 6, below) applies unchanged.
+
+### 6. `TableValidation`
+
+`<Table 3-4>` Fields of `TableValidation`
+
+| Field | Type | Meaning |
+|---|---|---|
+| `table` | `str` | Qualified name as written in the dump |
+| `rows` | `int` | Rows decoded from this table's `COPY` block |
+| `null_substitutions` | `dict[str, int]` | Per column, values that would be stored as NULL because the Arrow type could not represent them |
+| `text_fallback_columns` | `dict[str, str]` | Per column, the declared PostgreSQL type of a column that would be written as text because that type was not recognised |
+
+A trimmed `TableStats`: no `batches` or `delta_version`, since nothing is written, and no
+`schema_drift`, since there is no existing Delta table here to have drifted from.
+
 ---
 
 ## IV. Rust Surface
@@ -401,6 +490,24 @@ the calling thread.
 
 `run` accepting any `Read` is what makes the crate testable without touching the file
 system, and what would permit a future caller to stream from a network source.
+
+`pgdelta::validate` mirrors this shape without the Tokio runtime, since it writes
+nothing:
+
+```rust
+pub fn validate<R, F>(input: R, config: &ValidateConfig, progress: F) -> Result<ValidationReport>
+where
+    R: std::io::Read + 'static,
+    F: FnMut(Progress) -> bool;
+
+pub fn validate_file<F>(path: &Path, config: &ValidateConfig, progress: F) -> Result<ValidationReport>
+where
+    F: FnMut(Progress) -> bool;
+```
+
+Both block, but neither builds a runtime and neither may deadlock against one, since none
+exists: `validate` and `validate_file` are ordinary synchronous functions and may be
+called from anywhere, including from inside a Tokio runtime, unlike `run`/`run_file`.
 
 ### 2. `LoadConfig`
 
@@ -438,6 +545,7 @@ is what the Python `None` maps to.
 | `sink` | `relative_path`, `open_table`, `commit_table`, `TableWriter`, `TableSink`, `WriteMode` |
 | `dump` | `detect`, `decompressed`, `ChunkReader`, `Compression` |
 | `chan` | `bounded`, `Sender`, `Receiver` |
+| `validate` | `validate`, `validate_file`, `ValidateConfig`, `ValidationReport`, `TableValidation` |
 | `error` | `Error`, `Result` |
 
 Everything is public because the crate is intended for unrestricted downstream use, and

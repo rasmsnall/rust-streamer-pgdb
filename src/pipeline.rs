@@ -284,30 +284,6 @@ pub struct LoadReport {
     pub load_id: Option<String>,
 }
 
-/// Resolves each `COPY` column against the table's `CREATE TABLE` definition.
-///
-/// The `COPY` statement lists columns in transfer order, which need not match declaration
-/// order, so each name is looked up rather than taken positionally.
-///
-/// # Errors
-///
-/// [`Error::MalformedCreateTable`] if the `COPY` statement names a column the parsed DDL
-/// does not carry, which means the two disagree and the dump cannot be trusted.
-fn resolve_copy_columns(def: &TableDef, columns: &[String]) -> Result<Vec<ResolvedType>> {
-    columns
-        .iter()
-        .map(|name| {
-            def.columns
-                .iter()
-                .find(|c| &c.name == name)
-                .map(|c| types::resolve(&c.sql_type))
-                .ok_or_else(|| Error::MalformedCreateTable {
-                    table: def.name.qualified(),
-                })
-        })
-        .collect()
-}
-
 /// A table opened in phase one and awaiting its phase-two commit.
 struct CommitTarget {
     qualified: String,
@@ -634,9 +610,12 @@ where
 /// The reported figure is therefore comparable with the size of the dump on disk, which
 /// is what a caller driving a progress bar needs. Counting the decompressed stream would
 /// run several times past the file's length on a gzipped dump.
-struct CountingReader<R> {
-    inner: R,
-    count: Arc<AtomicU64>,
+///
+/// `pub(crate)` so [`crate::validate`] can report `bytes_read` the same way, against the
+/// same input.
+pub(crate) struct CountingReader<R> {
+    pub(crate) inner: R,
+    pub(crate) count: Arc<AtomicU64>,
 }
 
 impl<R: std::io::Read> std::io::Read for CountingReader<R> {
@@ -824,7 +803,7 @@ where
                             .ok_or_else(|| Error::MalformedCreateTable {
                                 table: qualified.clone(),
                             })?;
-                    let resolved = resolve_copy_columns(def, &columns)?;
+                    let resolved = types::resolve_copy_columns(def, &columns)?;
                     let pairs: Vec<(String, ResolvedType)> =
                         columns.iter().cloned().zip(resolved).collect();
                     let schema: ArrowSchemaRef = Arc::new(builders::arrow_schema(

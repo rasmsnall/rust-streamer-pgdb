@@ -34,6 +34,10 @@ dump file -> decode -> Arrow -> Delta
 - **Treats the dump as untrusted.** `#![forbid(unsafe_code)]`, path-traversal rejection on
   third-party table names, bounded field, row and column limits, and no row data in any
   error message.
+- **Validates cheaply before the real load.** `pgdelta.validate_dump` runs the same
+  structural, type-fidelity and path-traversal checks in seconds to low minutes, with no
+  Arrow, no Delta, no object store and no cluster, so a malformed dump is caught before
+  the expensive part starts. See [`docs/api.md`](docs/api.md), Chapter II, Section 7.
 
 ## Usage
 
@@ -53,6 +57,17 @@ print(f"{len(report.tables)} tables, {report.total_rows:,} rows")
 `expect_pg_major` is the tripwire for the source system being upgraded without notice. Set
 it on any unattended feed.
 
+Before that, optionally:
+
+```python
+pgdelta.validate_dump("/Volumes/main/landing/pg/day.sql", expect_pg_major=17)
+```
+
+Runs the same checks without writing anything, so a truncated transfer or a malformed
+row is caught in seconds rather than after the real load has spent its time on it. It
+cannot catch schema drift against an existing Delta table, since there is none to compare
+against here; that still needs the real load.
+
 ## Building
 
 ```
@@ -65,8 +80,15 @@ The wheel is `abi3`, so one artefact loads on CPython 3.10 and later, which cove
 Databricks Runtime 16.4 LTS and 17.3 LTS (both ship Python 3.12.3).
 
 Optional Cargo features: `azure` for `abfss://` output, `fast-gzip` for the zlib-ng
-decoder (needs cmake and a C toolchain), `extension-module` for the wheel build. Leave
-`extension-module` off for `cargo test`, which needs to link libpython.
+decoder (needs cmake and a C toolchain), `zstd` to decode zstd-compressed dumps (needs a
+C toolchain, no cmake), `extension-module` for the wheel build. Leave `extension-module`
+off for `cargo test`, which needs to link libpython.
+
+`zstd` is not yet part of CI's default feature set (see `.github/workflows/ci.yml`), so
+it needs its own check before relying on it: `cargo test --features zstd`. zstd is
+recognised by magic bytes and reported precisely as unsupported either way; the feature
+only controls whether it can be decoded. Measure before switching a sender to it: see
+`examples/throughput.rs` and the note in `src/dump.rs`.
 
 CI builds the manylinux artefact on every push and checks it imports and round-trips on
 3.10, 3.12 and 3.13. To reproduce a release build locally without a Linux box:

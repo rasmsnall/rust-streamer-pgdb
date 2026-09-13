@@ -181,17 +181,19 @@ downstream query must be written.
 | `pyo3` | Python bindings |
 | `deltalake` (delta-rs) | Delta write path; brings arrow/parquet/object_store/tokio/chrono |
 | `flate2` | gzip decode. Pure-Rust backend by default, so a wheel needs no C toolchain |
+| `zstd` | zstd decode, behind the optional `zstd` feature. Needs a C toolchain (zstd-sys), like `fast-gzip` |
 | `tokio` | Named directly by `sink.rs` and `pipeline.rs`. Pinned to what deltalake resolves |
 | `futures` | Stream combinators over the Delta file listing. Same pinning |
 | `memchr` | SIMD scan for `\n` / `\t` in the hot row loop |
 
 Pinned 2026-09 (probed via cargo; crates.io index reachable): `pyo3 0.29.2`,
-`deltalake 0.32.4`, `memchr 2.8.3`, `flate2 1.1.10`, `tokio 1.53.1`, `futures 0.3.34`.
-Note pyo3 0.29 renamed `Python::with_gil` to `attach` and `allow_threads` to `detach`,
-and it compiles cleanly under `#![forbid(unsafe_code)]`.
+`deltalake 0.32.4`, `memchr 2.8.3`, `flate2 1.1.10`, `zstd 0.13.3`, `tokio 1.53.1`,
+`futures 0.3.34`. Note pyo3 0.29 renamed `Python::with_gil` to `attach` and
+`allow_threads` to `detach`, and it compiles cleanly under `#![forbid(unsafe_code)]`.
 
 `/Volumes` FUSE paths need no object-store feature; `abfss://` needs deltalake's `azure`
-feature. `fast-gzip` selects the zlib-ng backend and needs a C toolchain and cmake.
+feature. `fast-gzip` selects the zlib-ng backend and needs a C toolchain and cmake;
+`zstd` needs a C toolchain only, no cmake.
 
 Use `deltalake::arrow` re-exports rather than a direct `arrow` dependency, to avoid
 version skew against delta-rs's pinned arrow.
@@ -375,6 +377,7 @@ src/builders.rs   Arrow column + batch builders
 src/sink.rs       Delta write path (open_table, TableWriter, commit_table)
 src/chan.rs       bounded MPMC channel feeding the decode pool
 src/pipeline.rs   orchestration (reader thread, decode/encode pool, two-phase commit)
+src/validate.rs   pre-flight dump validation, no Arrow/Delta/Tokio (validate_dump)
 src/python.rs     pyo3 surface
 python/pgdelta/__init__.py
 python/pgdelta/__init__.pyi
@@ -398,8 +401,59 @@ Resolved and shipped:
 - `maturin` installed; the wheel builds as `pgdelta-0.1.0-cp310-abi3`.
 - The 16-vs-17 question was an artifact of the staging-database architecture. No
   `pg_dump` binary and no PostgreSQL server are needed at all.
-- Compression: gzip is detected by magic bytes and decoded via `flate2`. zstd is
-  recognised and rejected with a precise error rather than misparsed.
+- Compression: gzip is detected by magic bytes and decoded via `flate2`. zstd is also
+  detected by magic bytes always; decoding it needs the optional `zstd` feature (a C
+  toolchain, exactly like `fast-gzip`), and without that feature it is rejected with a
+  precise error rather than misparsed. `zstd::stream::read::Decoder` concatenates frames
+  until EOF by default, mirroring `MultiGzDecoder`, so a multi-frame archive is read in
+  full; see `src/dump.rs`. Measure before asking a sender to switch: on one development
+  machine, zstd's default level decoded only around 20% faster than gzip's default
+  (pure-Rust) backend, not the large multiple sometimes assumed, and its ratio at that
+  level was marginally worse. `cargo run --release --features zstd --example throughput`
+  now measures both, so this is a re-run-on-real-hardware decision, not a settled one.
+- Parquet writer statistics: `sink::writer_properties` lowers `EnabledStatistics` from
+  parquet's own default (`Page`, a min/max/null-count recomputed roughly every megabyte
+  of column data) to `Chunk` (one per row group). Delta's own file-skipping statistics,
+  the ones a query engine actually prunes on, are computed separately from the Arrow
+  `RecordBatch` by delta-rs's writer (`writer::stats::create_add`) and are unaffected
+  either way; `Chunk` still leaves row-group-level statistics for a Parquet reader doing
+  its own pruning, and only drops the page-level `ColumnIndex`/`OffsetIndex` structures
+  that nothing in this pipeline or in Delta's own read path uses, cutting real CPU cost
+  on the pipeline's second-ranked bottleneck (Parquet encoding). Verified structurally,
+  not just reasoned about: `sink::tests::writer_properties_drop_the_page_index_but_keep_chunk_statistics`
+  builds one Parquet file at parquet's own default and one at this crate's setting, and
+  asserts the former's `ColumnIndexMetaData` is populated while the latter's is the
+  `NONE` placeholder, with chunk-level statistics still present in both. The codec stays
+  at delta-rs's own default, `SNAPPY`: already the fast end of the encode-CPU/output-size
+  trade-off, which is the right side of it for a CPU-bound bottleneck.
+- `pgdelta.validate_dump` (`src/validate.rs`): a pre-flight check that runs the same
+  structural, type-fidelity and path-traversal checks a real load applies before it ever
+  opens a Delta table, without writing anything, so a malformed dump is caught in seconds
+  to low minutes rather than after the driver has spent real time decoding it. Built as a
+  second, single-threaded consumer of `scan.rs`/`copy.rs`/`types.rs`/`values.rs` directly:
+  those last two were already free of any Arrow or Delta dependency by design, so the
+  validator needed no new dependency and never touches `builders.rs` or `sink.rs`'s hot,
+  tested write path. Shares (does not duplicate) `sink::relative_path`,
+  `sink::reject_managed_storage`, `manifest::reserved_collision`, and (made `pub(crate)`
+  for this) `builders::as_element` / `builders::array_element_type` for `native_arrays`
+  eligibility, and moved `resolve_copy_columns` out of `pipeline.rs` (was private) into
+  `types.rs` (now `pub`) so both callers use the one implementation. The one piece it
+  cannot literally share is `builders::ColumnBuilder::append`'s per-type dispatch, which
+  is expressed on Arrow-typed builder variants; `validate::validate_field` mirrors its
+  shape instead, calling the same `values::parse_*` functions, and is guarded by a
+  differential test (`tests/validate_matches_load.rs`) that runs a shared set of fixtures
+  through both `validate::validate` and `pipeline::run` and asserts they agree, the same
+  discipline the codebase already applies to `builders::arrow_type` vs
+  `builders::ColumnBuilder::new`. That test caught a real ordering bug before it shipped:
+  the validator checked the path-traversal guard before resolving a `COPY` block's columns
+  against its `CREATE TABLE`, so a `COPY` block for a table never declared produced
+  `UnsafeTableName` where the real pipeline produces `MalformedCreateTable`; fixed by
+  matching the real check order. Cannot catch schema drift against an existing Delta
+  table (no target to compare against) or an unreachable object store (none is opened);
+  both are documented gaps, not oversights. Python-only surface, matching
+  `stream_dump_to_delta`'s own binding pattern; no standalone CLI binary (decided with the
+  user: smaller surface, one build target, no new arg-parsing dependency to justify under
+  the minimal-dependency rule).
 - Commit cadence is one commit per table, all deferred to phase 2. No periodic commits,
   because a short table that looks complete is the worst failure mode here.
 - Schema drift is all-or-nothing ("either fail or load"), via two-phase.

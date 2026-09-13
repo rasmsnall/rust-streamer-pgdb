@@ -36,6 +36,8 @@ use deltalake::kernel::engine::arrow_conversion::TryIntoKernel;
 use deltalake::kernel::transaction::{CommitBuilder, TableReference};
 use deltalake::kernel::{Action, MetadataExt, StructType};
 use deltalake::logstore::LogStore;
+use deltalake::parquet::basic::Compression;
+use deltalake::parquet::file::properties::{EnabledStatistics, WriterProperties};
 use deltalake::protocol::{DeltaOperation, SaveMode};
 use deltalake::table::builder::ensure_table_uri;
 use deltalake::writer::{DeltaWriter, RecordBatchWriter};
@@ -603,6 +605,32 @@ pub async fn commit_table(
     Ok(version)
 }
 
+/// Parquet writer settings shared by every [`TableWriter`].
+///
+/// delta-rs's own default ([`RecordBatchWriter::try_new`]) sets only the codec, leaving
+/// `parquet`'s own default of page-level statistics (`EnabledStatistics::Page`): a
+/// min/max/null-count computed and stored for **every page**, roughly every megabyte of
+/// column data. That is real CPU cost on the pipeline's second-ranked bottleneck (see
+/// `docs/architecture.md`, Chapter IV, Section 3), and it buys this library nothing:
+/// Delta's own file-skipping statistics, the ones a query engine actually prunes on, are
+/// computed separately from the Arrow `RecordBatch` by delta-rs's own writer
+/// (`writer::stats::create_add`), not derived from Parquet's embedded statistics. Lowering
+/// to `EnabledStatistics::Chunk` keeps one min/max/null-count per row group, which is what
+/// a Parquet reader doing its own row-group-level pruning uses, and drops only the
+/// finer-grained per-page figures nothing here reads.
+///
+/// The codec is left at delta-rs's own default, `SNAPPY`: it is already the fast end of
+/// the trade-off between encode CPU and output size, which is the right side of that
+/// trade-off for a pipeline whose second bottleneck is CPU-bound Parquet encoding, not
+/// storage cost. Switching to a heavier codec (zstd, gzip) would shrink files at the cost
+/// of more encode CPU, which is the wrong direction here.
+fn writer_properties() -> WriterProperties {
+    WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .set_statistics_enabled(EnabledStatistics::Chunk)
+        .build()
+}
+
 /// Encodes one table's batches into Parquet and stages the resulting files.
 ///
 /// One of these exists per decode worker per open `COPY` block, so Parquet encoding, the
@@ -624,6 +652,12 @@ impl TableWriter {
     /// because under [`WriteMode::Overwrite`] the dump may carry a different one and the
     /// files must be written in the shape that [`commit_table`] is about to declare.
     ///
+    /// Writes with this crate's own writer properties rather than delta-rs's own
+    /// default: the same codec, but row-group-level rather than page-level Parquet
+    /// statistics. See `docs/architecture.md`, Chapter III, Section 6, for why the
+    /// finer-grained default costs CPU on this pipeline's second bottleneck for nothing
+    /// this library, or Delta's own file skipping, reads back.
+    ///
     /// # Errors
     ///
     /// [`Error::Delta`] if a writer cannot be built for that location.
@@ -638,7 +672,8 @@ impl TableWriter {
     ) -> Result<Self> {
         Ok(Self {
             writer: RecordBatchWriter::try_new(uri, schema, None, Some(storage_options.clone()))
-                .map_err(delta)?,
+                .map_err(delta)?
+                .with_writer_properties(writer_properties()),
             rows: 0,
         })
     }
@@ -1013,6 +1048,69 @@ mod tests {
         });
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// [`writer_properties`] must actually change what is written, not merely compile:
+    /// chunk-level statistics still let a reader prune by row group, but must not carry
+    /// the finer-grained page-level `ColumnIndex` entries that only
+    /// `EnabledStatistics::Page` (parquet's own default) populates. Compares directly
+    /// against parquet's own default to make sure this is the setting actually
+    /// responsible, rather than assuming from the builder call alone.
+    ///
+    /// The file-level `ParquetMetaData::column_index()` accessor is `Some` as soon as
+    /// page-index reading is requested at all, regardless of whether any column has real
+    /// per-page statistics in it: an absent per-column index is represented by the
+    /// `ColumnIndexMetaData::NONE` placeholder nested inside, not by omitting the outer
+    /// `Option`. The per-column entry is what this test has to compare.
+    #[test]
+    fn writer_properties_drop_the_page_index_but_keep_chunk_statistics() {
+        use deltalake::parquet::arrow::ArrowWriter;
+        use deltalake::parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader};
+        use deltalake::parquet::file::page_index::column_index::ColumnIndexMetaData;
+
+        fn parquet_bytes(props: WriterProperties) -> bytes::Bytes {
+            let mut buf = Vec::new();
+            {
+                let mut writer =
+                    ArrowWriter::try_new(&mut buf, Arc::new(schema()), Some(props)).unwrap();
+                writer.write(&batch(&[1, 2, 3], &["a", "b", "c"])).unwrap();
+                writer.close().unwrap();
+            }
+            bytes::Bytes::from(buf)
+        }
+
+        fn metadata_of(
+            bytes: &bytes::Bytes,
+        ) -> deltalake::parquet::file::metadata::ParquetMetaData {
+            ParquetMetaDataReader::new()
+                .with_page_index_policy(PageIndexPolicy::Required)
+                .parse_and_finish(bytes)
+                .unwrap()
+        }
+
+        // parquet's own default (EnabledStatistics::Page), as a sanity check that a real
+        // page-level index is the thing this test would detect at all.
+        let page_level = metadata_of(&parquet_bytes(WriterProperties::builder().build()));
+        assert_ne!(
+            page_level.column_index().unwrap()[0][0],
+            ColumnIndexMetaData::NONE,
+            "the default writer properties are expected to populate a page-level column \
+             index; if this starts failing, parquet's own default has changed and the \
+             comparison below no longer proves anything"
+        );
+
+        let ours = metadata_of(&parquet_bytes(writer_properties()));
+        assert!(
+            ours.row_group(0).column(0).statistics().is_some(),
+            "chunk-level statistics must still be written for row-group pruning"
+        );
+        assert_eq!(
+            ours.column_index().unwrap()[0][0],
+            ColumnIndexMetaData::NONE,
+            "the page-level column index must not be populated: nothing this library or \
+             Delta's own file-skipping stats reads it, and computing it costs CPU on the \
+             pipeline's second-ranked bottleneck"
+        );
     }
 
     #[test]

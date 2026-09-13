@@ -16,6 +16,9 @@
 //! tables the type zoo is wide, and one unknown type must not kill a scheduled load.
 //! Nothing is lost, because text can be reinterpreted later.
 
+use crate::error::{Error, Result};
+use crate::scan::TableDef;
+
 /// The subset of PostgreSQL's type system this library distinguishes.
 ///
 /// Everything not listed resolves to [`PgType::Text`]. That is a deliberate floor rather
@@ -262,6 +265,36 @@ pub fn resolve(sql_type: &str) -> ResolvedType {
         recognised: true,
         source,
     }
+}
+
+/// Resolves each `COPY` column against the table's `CREATE TABLE` definition.
+///
+/// The `COPY` statement lists columns in transfer order, which need not match declaration
+/// order, so each name is looked up rather than taken positionally. Shared by
+/// [`crate::pipeline`] and [`crate::validate`], so the two agree by construction on what a
+/// `COPY` header resolves to.
+///
+/// # Errors
+///
+/// [`Error::MalformedCreateTable`] if the `COPY` statement names a column the parsed DDL
+/// does not carry, which means the two disagree and the dump cannot be trusted.
+///
+/// # Panics
+///
+/// Does not panic.
+pub fn resolve_copy_columns(def: &TableDef, columns: &[String]) -> Result<Vec<ResolvedType>> {
+    columns
+        .iter()
+        .map(|name| {
+            def.columns
+                .iter()
+                .find(|c| &c.name == name)
+                .map(|c| resolve(&c.sql_type))
+                .ok_or_else(|| Error::MalformedCreateTable {
+                    table: def.name.qualified(),
+                })
+        })
+        .collect()
 }
 
 /// Removes trailing array suffixes such as `[]`, `[3]`, or `[][]`, counting how many were

@@ -2558,6 +2558,7 @@ dependencies = [
  "pyo3",
  "tokio",
  "url",
+ "zstd",
 ]
 
 [[package]]

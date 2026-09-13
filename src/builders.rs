@@ -101,7 +101,10 @@ pub fn arrow_type(
 /// Used to resolve a one-dimensional array's element type by recursing into the same
 /// scalar logic ([`arrow_type`], [`ColumnBuilder::new`]) a plain column of that type
 /// would use, rather than duplicating it.
-fn as_element(rt: &ResolvedType) -> ResolvedType {
+///
+/// `pub(crate)` so [`crate::validate`] can reuse the exact same `native_arrays`
+/// eligibility decision rather than re-deriving it; see [`array_element_type`].
+pub(crate) fn as_element(rt: &ResolvedType) -> ResolvedType {
     ResolvedType {
         is_array: false,
         array_dimensions: 0,
@@ -121,7 +124,14 @@ fn as_element(rt: &ResolvedType) -> ResolvedType {
 /// [`types::numeric_too_wide`]). Every other `PgType` always has a concrete Arrow mapping.
 ///
 /// `rt` must already be de-arrayed, as [`as_element`] produces.
-fn array_element_type(rt: &ResolvedType, wide_numeric_as_decimal: bool) -> Option<DataType> {
+///
+/// `pub(crate)` so [`crate::validate`] can ask "is this array eligible for
+/// `native_arrays`" without re-deriving the decision; only whether the result is `Some`
+/// matters there; the `DataType` itself is not otherwise touched outside `builders.rs`.
+pub(crate) fn array_element_type(
+    rt: &ResolvedType,
+    wide_numeric_as_decimal: bool,
+) -> Option<DataType> {
     debug_assert!(!rt.is_array);
     let unsupported = match rt.pg {
         PgType::Text => !rt.recognised,

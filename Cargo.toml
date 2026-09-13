@@ -28,6 +28,13 @@ memchr = "2.8.3"
 # available, build with --features fast-gzip for the zlib-ng backend.
 flate2 = "1.1.10"
 
+# zstd decompression, gated behind the `zstd` feature (see [features] below). Links
+# libzstd via zstd-sys and needs a C toolchain at build time, exactly like fast-gzip's
+# zlib-ng backend, so it is optional rather than default: most wheels need no toolchain
+# at all. A candidate for a faster serial floor than gzip (see src/dump.rs), but measure
+# on real hardware before asking a sender to switch: it is not a large win by default.
+zstd = { version = "0.13.3", optional = true }
+
 # Delta write path. Arrow, parquet, object_store and tokio arrive transitively; use the
 # deltalake::arrow re-export rather than a direct arrow dependency, to avoid version skew
 # against the arrow release delta-rs pins.
@@ -57,6 +64,10 @@ default = []
 extension-module = ["pyo3/extension-module"]
 # Faster gzip via zlib-ng. Requires a C toolchain and cmake at build time.
 fast-gzip = ["flate2/zlib-ng"]
+# zstd decompression. The format is always recognised by magic bytes; decoding it needs
+# this feature compiled in, or the load fails with a precise UnsupportedCompression error
+# instead of a corrupt parse. Requires a C toolchain to build (links libzstd via zstd-sys).
+zstd = ["dep:zstd"]
 # Cloud object stores, for reading a dump from, or writing tables to, that backend.
 # Not needed for a local path or a /Volumes FUSE path.
 azure = ["deltalake/azure"]
