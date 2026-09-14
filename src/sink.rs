@@ -1014,6 +1014,105 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Delta Lake has no time-of-day type, so a schema declaring Arrow's `Time64` fails
+    /// table creation outright with a schema-conversion error, never a clean commit. This
+    /// is why `builders::arrow_type` must never emit `Time64` for a PostgreSQL `time`
+    /// column; see the `time_is_kept_as_literal_text` test in `builders.rs`.
+    #[test]
+    fn a_time64_column_is_rejected_by_delta() {
+        let dir = std::env::temp_dir().join(format!("pgdelta-time64-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let time_schema = ArrowSchema::new(vec![Field::new(
+            "seen",
+            DataType::Time64(TimeUnit::Microsecond),
+            true,
+        )]);
+
+        rt().block_on(async {
+            let err = TableSink::open(
+                &prefix(&dir),
+                &bare("t"),
+                &time_schema,
+                WriteMode::Append,
+                &HashMap::new(),
+            )
+            .await
+            .unwrap_err();
+            let message = err.to_string();
+            assert!(
+                message.contains("Invalid data type for Delta Lake"),
+                "expected a schema-conversion error naming the unsupported type, got: {message}"
+            );
+        });
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// End-to-end regression for the fix above: `builders::arrow_type` must map a `time`
+    /// column so that it actually commits, not merely so that `arrow_type` returns
+    /// something plausible-looking in isolation. Goes through the same `resolve` ->
+    /// `arrow_schema`/`BatchBuilder` -> `TableSink` path the real pipeline uses, so a
+    /// regression back to `Time64` would fail here exactly as
+    /// `a_time64_column_is_rejected_by_delta` demonstrates in isolation.
+    #[test]
+    fn a_time_column_commits_as_literal_text() {
+        use crate::builders::{BatchBuilder, arrow_schema};
+        use crate::types::resolve;
+
+        let dir = std::env::temp_dir().join(format!("pgdelta-time-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let columns = vec![("seen".to_string(), resolve("time without time zone"))];
+        let arrow_schema = arrow_schema(&columns, false, false);
+        let mut builder = BatchBuilder::new(&columns, 10, 1 << 20, false, false);
+        builder
+            .append_row(&[Some(b"13:04:05.5".as_slice())])
+            .unwrap();
+        let record_batch = builder.finish().unwrap().unwrap();
+
+        rt().block_on(async {
+            let mut sink = TableSink::open(
+                &prefix(&dir),
+                &bare("t"),
+                &arrow_schema,
+                WriteMode::Append,
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+
+            sink.write(record_batch).await.unwrap();
+            sink.stage().await.unwrap();
+            sink.commit().await.unwrap();
+
+            let schema_json = format!("{:?}", sink.table.snapshot().unwrap().schema());
+            assert!(
+                schema_json.to_ascii_lowercase().contains("string"),
+                "a time column must commit as Delta's string type: {schema_json}"
+            );
+            assert!(
+                !schema_json.to_ascii_lowercase().contains("time"),
+                "the committed schema must not mention a time type at all: {schema_json}"
+            );
+
+            let files = sink
+                .table
+                .snapshot()
+                .unwrap()
+                .snapshot()
+                .file_views(&sink.table.log_store(), None)
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert_eq!(files.len(), 1, "the commit must produce exactly one file");
+        });
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn new_tables_sit_at_the_compatibility_floor() {
         let dir = std::env::temp_dir().join(format!("pgdelta-proto-{}", std::process::id()));

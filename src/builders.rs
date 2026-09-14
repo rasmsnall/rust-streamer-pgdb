@@ -22,7 +22,7 @@ use std::sync::Arc;
 use deltalake::arrow::array::{
     ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder, Float32Builder,
     Float64Builder, Int16Builder, Int32Builder, Int64Builder, ListArray, RecordBatch,
-    StringBuilder, Time64MicrosecondBuilder, TimestampMicrosecondBuilder,
+    StringBuilder, TimestampMicrosecondBuilder,
 };
 use deltalake::arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use deltalake::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -90,7 +90,10 @@ pub fn arrow_type(
         // (see the UTC constant's doc), and a bare Arrow `Timestamp` with no timezone at
         // all would map to Delta's timestamp_ntz instead of timestamp.
         PgType::Timestamp { .. } => DataType::Timestamp(TimeUnit::Microsecond, Some(UTC.into())),
-        PgType::Time { .. } => DataType::Time64(TimeUnit::Microsecond),
+        // is_textual has already returned above: Delta has no time-of-day type, so `time`
+        // is kept as its literal text rather than mapped to Arrow's Time64, which Delta
+        // rejects outright at table creation (`Invalid data type for Delta Lake`).
+        PgType::Time { .. } => DataType::Utf8,
         PgType::Bytea => DataType::Binary,
         PgType::Text => DataType::Utf8,
     }
@@ -192,8 +195,6 @@ pub enum ColumnBuilder {
     Date(Date32Builder),
     /// `timestamp`, with a flag for whether the source carries an offset.
     Timestamp(TimestampMicrosecondBuilder, bool),
-    /// `time`.
-    Time(Time64MicrosecondBuilder),
     /// `bytea`.
     Binary(BinaryBuilder),
     /// A one-dimensional array, native to Arrow under `native_arrays`. `element` is any
@@ -280,7 +281,8 @@ impl ColumnBuilder {
             PgType::Timestamp { tz } => {
                 ColumnBuilder::Timestamp(TimestampMicrosecondBuilder::new(), tz)
             }
-            PgType::Time { .. } => ColumnBuilder::Time(Time64MicrosecondBuilder::new()),
+            // is_textual has already returned above for PgType::Time; see arrow_type.
+            PgType::Time { .. } => ColumnBuilder::Utf8(StringBuilder::new()),
             PgType::Bytea => ColumnBuilder::Binary(BinaryBuilder::new()),
             PgType::Text => ColumnBuilder::Utf8(StringBuilder::new()),
         }
@@ -328,7 +330,6 @@ impl ColumnBuilder {
                 substituted = parsed.is_none();
                 b.append_option(parsed);
             }
-            ColumnBuilder::Time(b) => b.append_option(values::parse_time(v, column)?),
             ColumnBuilder::Binary(b) => {
                 // Decoded into a scratch buffer so the builder receives one contiguous
                 // value rather than being appended to byte by byte.
@@ -381,7 +382,6 @@ impl ColumnBuilder {
             ColumnBuilder::Boolean(b) => b.append_null(),
             ColumnBuilder::Date(b) => b.append_null(),
             ColumnBuilder::Timestamp(b, _) => b.append_null(),
-            ColumnBuilder::Time(b) => b.append_null(),
             ColumnBuilder::Binary(b) => b.append_null(),
             ColumnBuilder::List {
                 offsets, validity, ..
@@ -417,7 +417,6 @@ impl ColumnBuilder {
                 // type must agree with the schema's or batch construction fails.
                 Arc::new(b.finish().with_timezone(UTC))
             }
-            ColumnBuilder::Time(b) => Arc::new(b.finish()),
             ColumnBuilder::Binary(b) => Arc::new(b.finish()),
             ColumnBuilder::List {
                 element,
@@ -665,9 +664,37 @@ mod tests {
             arrow_type(&resolve("timestamp with time zone"), false, false),
             DataType::Timestamp(TimeUnit::Microsecond, Some(UTC.into()))
         );
+    }
+
+    /// Delta Lake has no time-of-day type: a schema declaring `Time64` fails table
+    /// creation outright with `Invalid data type for Delta Lake` (see
+    /// `sink::tests::a_time64_column_is_rejected_by_delta`), so `time` is kept as its
+    /// literal text instead, consistent with this crate's "type uncertainty degrades,
+    /// never fails" fidelity policy even though `time` is itself a recognised type.
+    #[test]
+    fn time_is_kept_as_literal_text() {
+        for t in ["time without time zone", "time with time zone"] {
+            let rt = resolve(t);
+            assert_eq!(arrow_type(&rt, false, false), DataType::Utf8, "{t}");
+            assert!(
+                rt.recognised,
+                "{t} is understood; Delta's limitation is not type uncertainty"
+            );
+        }
+
+        let columns = cols(&[("seen", "time without time zone")]);
+        let mut b = BatchBuilder::new(&columns, 10, 1 << 20, false, false);
+        b.append_row(&[Some(b"13:04:05.5")]).unwrap();
+        let batch = b.finish().unwrap().unwrap();
+        let got = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         assert_eq!(
-            arrow_type(&resolve("time without time zone"), false, false),
-            DataType::Time64(TimeUnit::Microsecond)
+            got.value(0),
+            "13:04:05.5",
+            "the literal text must survive unchanged"
         );
     }
 

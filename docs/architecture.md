@@ -674,7 +674,7 @@ than if.
 | `date` | `Date32` |
 | `timestamp` | `Timestamp(Micros, UTC)`, assumed UTC (§4) |
 | `timestamptz` | `Timestamp(Micros, UTC)` |
-| `time` | `Time64(Micros)` |
+| `time` | `Utf8`, always (§2) |
 | `bytea` | `Binary` |
 | `text`, `varchar`, `char`, `uuid`, `json`, `jsonb`, `inet`, `interval` | `Utf8` |
 | A one-dimensional array of a supported element type | `Utf8`, or `List(element)` opted into with `native_arrays` |
@@ -686,6 +686,16 @@ avoids guessing at a structure the caller may not want, and the text remains con
 downstream. An array is retained as PostgreSQL's own `{...}` literal by default for the
 same reason, but `native_arrays` opts a one-dimensional array of a supported element type
 into a native Arrow `List` instead. See Section 2.
+
+`time` is retained as its literal text for a different reason: Delta Lake has no
+time-of-day type at all. Arrow's own `Time64` exists and the builder side of this library
+once used it, but handing that type to Delta fails table creation outright with `Schema
+error: Invalid data type for Delta Lake: Time64(µs)`, so this is not a stylistic choice the
+way `interval` is, it is the only option. `time` still counts as a **recognised** type in
+the run statistics; the fallback to text is Delta's limitation, not type uncertainty, so it
+does not appear alongside genuinely unrecognised types. See Section 2 for the value-level
+consequence: unlike an unrecognised type, a `time` value is not re-validated on this path,
+since PostgreSQL already validated it once, on the way into the dump.
 
 `timestamp` is stamped with the `UTC` timezone in its Arrow type regardless of whether
 the source carried one. An Arrow `Timestamp` with *no* timezone at all is delta-rs's own

@@ -103,9 +103,10 @@ impl ResolvedType {
     /// True if this column will be written as text, whatever its declaration said.
     ///
     /// Arrays, unconstrained `numeric`, `numeric` whose precision or scale Arrow cannot
-    /// represent, and everything unrecognised all answer true.
+    /// represent, `time` (Delta has no time-of-day type; see `builders::arrow_type`), and
+    /// everything unrecognised all answer true.
     pub fn is_textual(&self) -> bool {
-        if self.is_array || self.pg == PgType::Text {
+        if self.is_array || self.pg == PgType::Text || matches!(self.pg, PgType::Time { .. }) {
             return true;
         }
         matches!(self.pg, PgType::Numeric { precision, scale } if !decimal_fits(precision, scale))
@@ -553,6 +554,19 @@ mod tests {
         assert_eq!(
             pg("TIMESTAMP  WITHOUT  TIME  ZONE"),
             PgType::Timestamp { tz: false }
+        );
+    }
+
+    /// Delta Lake has no time-of-day type, so `time` is kept as literal text rather than
+    /// mapped to Arrow's `Time64`, which Delta rejects outright at table creation. See
+    /// `builders::arrow_type` and its `time_is_kept_as_literal_text` test.
+    #[test]
+    fn time_is_textual_because_delta_cannot_store_time64() {
+        assert!(resolve("time without time zone").is_textual());
+        assert!(resolve("time with time zone").is_textual());
+        assert!(
+            resolve("time without time zone").recognised,
+            "time is a known type; is_textual is Delta's limitation, not type uncertainty"
         );
     }
 

@@ -604,16 +604,14 @@ fn validate_field(
         }
         PgType::Date => values::parse_date(v, column)?.is_none(),
         PgType::Timestamp { tz } => values::parse_timestamp(v, tz, column)?.is_none(),
-        PgType::Time { .. } => {
-            values::parse_time(v, column)?;
-            false
-        }
         PgType::Bytea => {
             values::parse_bytea(v, column, &mut Vec::new())?;
             false
         }
-        // is_textual() already returned above for PgType::Text.
-        PgType::Text => false,
+        // is_textual() already returned above for PgType::Text and PgType::Time: Delta
+        // has no time-of-day type, so `time` is kept as literal text like any other
+        // textual column, and validated the same way (UTF-8 only). See builders::arrow_type.
+        PgType::Text | PgType::Time { .. } => false,
     })
 }
 

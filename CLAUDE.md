@@ -243,7 +243,7 @@ These are requirements, not suggestions. They were the starting point of the des
 | `date` | `Date32` |
 | `timestamp` | `Timestamp(Micros, UTC)`, assumed UTC (see below) |
 | `timestamptz` | `Timestamp(Micros, UTC)` |
-| `time` | `Time64(Micros)` |
+| `time` | `Utf8` (literal text; Delta has no time-of-day type) |
 | `bytea` | `Binary` (decode `\x` hex; fall back to escape format) |
 | `text`,`varchar`,`char`,`uuid`,`json`,`jsonb`,`inet`,`interval` | `Utf8` |
 | One-dimensional array of a supported element type | `Utf8`, or `List(element)` with `native_arrays` |
@@ -553,6 +553,34 @@ Resolved and shipped:
 - Re-run story: `overwrite` is idempotent and a failed run commits nothing, so the
   recovery procedure is to run it again. Documented in `docs/operations.md`, Chapter V.
 - `VACUUM` guidance and a per-table loop are in `docs/operations.md`, Chapter IV.
+- Fixed a real defect surfaced by the sibling `rust-streamer-tiberius` project's own use of
+  the identical mapping against a real Delta table: `time` was declared in the Arrow
+  schema as `Time64(Microsecond)`, a type Delta Lake cannot store at all, so committing any
+  table with a `time` column failed table creation outright with `Schema error: Invalid
+  data type for Delta Lake: Time64(µs)`. No existing test in `builders.rs` or `sink.rs`
+  actually committed a `time` column through the Delta write path, only through the Arrow
+  builder in isolation, which is why the defect went unnoticed: the builder side works
+  fine, and only the Delta commit rejects it. Confirmed empirically before fixing, not just
+  reasoned about, with a sink test that hands `TableSink::open` a schema declaring
+  `Time64` and asserts the resulting error names the type
+  (`sink::tests::a_time64_column_is_rejected_by_delta`). Fixed by mapping `time` to `Utf8`
+  instead, kept as its unescaped literal text: `types::ResolvedType::is_textual` now
+  answers true for `PgType::Time` alongside arrays and unrepresentable `numeric`, which
+  `builders::arrow_type`/`ColumnBuilder::new` both already check first, so no new match arm
+  duplicates the decision, and `validate::validate_field`'s now-unreachable dedicated
+  `PgType::Time` arm was merged into the same "is_textual already returned above" case as
+  `PgType::Text`, keeping validation and the real load in agreement (`validate_matches_load`
+  covers this). `time` stays `recognised: true` throughout (only `PgType::Text` with
+  `recognised: false` counts as a fallback), so it deliberately does **not** appear in
+  `text_fallback_columns`: the type is understood, it is Delta that cannot store it,
+  matching the sibling project's own decision. `values::parse_time`'s range validation
+  (rejecting an out-of-range time like `25:00:00`) is no longer applied on this path,
+  matching every other textual column (`interval`, `jsonb`, an unrecognised type): text is
+  a faithful passthrough of what the dump already contained, not a value to reinterpret and
+  re-validate, and PostgreSQL itself already validated it on the way in. A new end-to-end
+  regression test (`sink::tests::a_time_column_commits_as_literal_text`) goes through
+  `types::resolve` -> `builders::arrow_schema`/`BatchBuilder` -> `TableSink` exactly as the
+  real pipeline does, so a regression back to `Time64` would fail here again.
 
 Still open, and each needs a decision rather than a default:
 
